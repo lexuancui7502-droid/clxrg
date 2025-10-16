@@ -1,0 +1,3 @@
+[submodule "clx/code/LLaVa-Rad"]
+	path = clx/code/LLaVa-Rad
+	url = https://github.com/lexuancui7502-droid/clxrg.git

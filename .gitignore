@@ -1,0 +1,15 @@
+
+# model weights
+clx/weights/
+*.bin
+*.pt
+*.ckpt
+*.safetensors
+
+# ignore large data & weights
+clx/data/
+clx/weights/
+*.bin
+*.pt
+*.ckpt
+*.safetensors
