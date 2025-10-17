@@ -1,0 +1,231 @@
+# -*- coding: utf-8 -*-
+# run.py — Report Generation Evaluation
+# [2024-10-16] 重要改动：
+#   1) 顶部导入稳健化：优先相对导入，失败再绝对导入，兼容从仓库根/包内启动。
+#   2) BLEU-1 增加 fallback：evaluate 不可用时，退回内置 BLEU-1。
+#   3) wandb 键名统一字符串化，数值统一转 python 标量，避免类型报错。
+
+from typing import List
+import os
+import json
+import random
+
+import evaluate
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+from sacrebleu.metrics import BLEU
+
+# [2024-10-16] 稳健导入：优先相对导入；失败再绝对导入
+try:
+    from . import chexbert as _chexbert
+    from . import rouge as _rouge
+    from . import f1radgraph as _f1radgraph
+    from .f1radgraph import F1RadGraphv2
+    from .factuality_utils import CONDITIONS
+except Exception:
+    from llava.eval.rrg_eval import chexbert as _chexbert
+    from llava.eval.rrg_eval import rouge as _rouge
+    from llava.eval.rrg_eval import f1radgraph as _f1radgraph
+    from llava.eval.rrg_eval.f1radgraph import F1RadGraphv2
+    from llava.eval.rrg_eval.factuality_utils import CONDITIONS
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+random.seed(3)
+np.random.seed(3)
+
+def bleu4(predictions, references, bootstrap_ci: bool = False):
+    if bootstrap_ci:
+        ret = BLEU().corpus_score(hypotheses=predictions, references=[references], n_bootstrap=500)
+        return {"median": ret.score, "ci_l": ret._mean - ret._ci, "ci_h": ret._mean + ret._ci}
+    else:
+        return evaluate.load("bleu").compute(predictions=predictions, references=references)["bleu"]
+
+# [2024-10-16] BLEU-1 增加 fallback
+def bleu1(predictions, references, bootstrap_ci: bool = False):
+    try:
+        metric = evaluate.load("bleu")
+        return metric.compute(predictions=predictions, references=references, max_order=1)["bleu"]
+    except Exception as e:
+        print("[WARN] evaluate 'bleu' unavailable, using internal BLEU-1:", e)
+        from collections import Counter
+        import math
+        c_len = r_len = match = 0
+        for hyp, ref in zip(predictions, references):
+            ht, rt = hyp.strip().split(), ref.strip().split()
+            c_len += len(ht); r_len += len(rt)
+            match += sum((Counter(ht) & Counter(rt)).values())
+        if c_len == 0: return 0.0
+        p1 = match / c_len
+        bp = math.exp(1 - r_len / c_len) if 0 < c_len < r_len else 1.0
+        return bp * p1
+
+def rougel(predictions, references, bootstrap_ci: bool = False):
+    if bootstrap_ci:
+        return _rouge.compute(predictions, references, ["rougeL"])["rougeL"]
+    else:
+        return evaluate.load("rouge").compute(predictions=predictions, references=references)["rougeL"]
+
+def rouge2(predictions, references, bootstrap_ci: bool = False):
+    if bootstrap_ci:
+        return _rouge.compute(predictions, references, ["rouge2"])["rouge2"]
+    else:
+        return evaluate.load("rouge").compute(predictions=predictions, references=references)["rouge2"]
+
+def bertscore(predictions, references):
+    return evaluate.load("bertscore").compute(predictions=predictions, references=references)["f1"]
+
+def radgraph(predictions, references, bootstrap_ci: bool = False):
+    if bootstrap_ci:
+        reward_list = F1RadGraphv2(reward_level="partial", batch_size=1)(hyps=predictions, refs=references)[1]
+        bs = _f1radgraph.bootstrap_confidence_interval(reward_list, n_resamples=500)
+        return {"median": np.median(bs.bootstrap_distribution),
+                "ci_l": bs.confidence_interval.low,
+                "ci_h": bs.confidence_interval.high}
+    else:
+        return F1RadGraphv2(reward_level="partial", batch_size=1)(hyps=predictions, refs=references)[0]
+
+def chexbert(predictions, references, bootstrap_ci: bool = False):
+    return _chexbert.evaluate(predictions, references, include_original=False, bootstrap_ci=bootstrap_ci)
+
+SCORER_NAME_TO_CLASS = {
+    "ROUGE-L": rougel,
+    "ROUGE-2": rouge2,
+    "BLEU-4": bleu4,
+    "BLEU-1": bleu1,
+    "BERTScore": bertscore,
+    "F1-RadGraph": radgraph,
+    "CheXbert": chexbert,
+}
+
+class ReportGenerationEvaluator:
+    def __init__(self, scorers=['CheXbert'], bootstrap_ci: bool = False):
+        self.bootstrap_ci = bootstrap_ci
+        self.scorers = {name: SCORER_NAME_TO_CLASS[name] for name in scorers}
+
+    def evaluate(self, predictions, references):
+        assert len(predictions) == len(references)
+        scores = {}
+        for scorer_name, scorer in (pbar := tqdm(self.scorers.items())):
+            pbar.set_description(scorer_name)
+            scores[scorer_name] = scorer(predictions, references, self.bootstrap_ci)
+        self.postprocess_eval(scores)
+        return scores
+
+    def postprocess_eval(self, scores):
+        if self.bootstrap_ci:
+            keys = ("median", "ci_l", "ci_h")
+            for name in list(scores.keys()):
+                if name == "CheXbert":
+                    metrics = scores.pop(name)
+                    scores["Micro-F1-14"]  = {k: metrics[0]["micro avg"][k] for k in keys}
+                    scores["Macro-F1-14"]  = {k: metrics[0]["macro avg"][k] for k in keys}
+                    scores["Micro-F1-5"]   = {k: metrics[1]["micro avg"][k] for k in keys}
+                    scores["Macro-F1-5"]   = {k: metrics[1]["macro avg"][k] for k in keys}
+                    scores["Micro-F1-14+"] = {k: metrics[2]["micro avg"][k] for k in keys}
+                    scores["Macro-F1-14+"] = {k: metrics[2]["macro avg"][k] for k in keys}
+                    scores["Micro-F1-5+"]  = {k: metrics[3]["micro avg"][k] for k in keys}
+                    scores["Macro-F1-5+"]  = {k: metrics[3]["macro avg"][k] for k in keys}
+                    scores["breakdown-"] = metrics[0]
+                    scores["breakdown+"] = metrics[2]
+                    scores["chexbert_metrics"] = metrics[-1]
+                elif name == "F1-RadGraph":
+                    scores["F1-RadGraph"] = scores.pop(name)
+        else:
+            for name in list(scores.keys()):
+                if name == "CheXbert":
+                    metrics = scores.pop(name)
+                    scores.update({
+                        "Micro-F1-14" : metrics[0]["micro avg"]["f1-score"],
+                        "Macro-F1-14" : metrics[0]["macro avg"]["f1-score"],
+                        "Micro-F1-5"  : metrics[1]["micro avg"]["f1-score"],
+                        "Macro-F1-5"  : metrics[1]["macro avg"]["f1-score"],
+                        "Micro-F1-14+": metrics[2]["micro avg"]["f1-score"],
+                        "Macro-F1-14+": metrics[2]["macro avg"]["f1-score"],
+                        "Micro-F1-5+" : metrics[3]["micro avg"]["f1-score"],
+                        "Macro-F1-5+" : metrics[3]["macro avg"]["f1-score"],
+                        "breakdown-"  : metrics[0],
+                        "breakdown+"  : metrics[2],
+                        "chexbert_metrics": metrics[-1],
+                    })
+                elif name == "F1-RadGraph":
+                    scores["F1-RadGraph"] = scores.pop(name)["f1-radgraph"]
+
+def main(
+    filepath: str,
+    scorers: List = None,
+    report_chexbert_f1: bool = False,
+    bootstrap_ci: bool = True,
+    output_dir: str = "./",
+    run_name: str = "mimic_cxr_eval",
+):
+    with open(filepath) as f:
+        preds, refs = [], []
+        for l in f:
+            d = json.loads(l)
+            preds.append(d["prediction"]); refs.append(d["reference"])
+
+    if scorers is None:
+        scorers = ['CheXbert','F1-RadGraph','BLEU-1','BLEU-4','ROUGE-L']
+
+    evaluator = ReportGenerationEvaluator(scorers=scorers, bootstrap_ci=bootstrap_ci)
+    results = evaluator.evaluate(preds, refs)
+
+    print("\nTotal reports:", len(preds), "\n")
+    print("========== Main Results ==========")
+    if bootstrap_ci:
+        main_results = pd.DataFrame.from_dict({k:v for k,v in results.items()
+                               if k not in ("breakdown+","breakdown-","chexbert_metrics")})
+        print(main_results[["Micro-F1-14","Micro-F1-5","Macro-F1-14","Macro-F1-5",
+                            "Micro-F1-14+","Micro-F1-5+","Macro-F1-14+","Macro-F1-5+",
+                            "F1-RadGraph","BLEU-1","BLEU-4","ROUGE-L"]])
+    else:
+        main_results = pd.DataFrame.from_dict({k:v for k,v in results.items() if not isinstance(v, dict)}, 'index')
+        print(main_results.T[["Micro-F1-14","Micro-F1-5","Macro-F1-14","Macro-F1-5",
+                              "Micro-F1-14+","Micro-F1-5+","Macro-F1-14+","Macro-F1-5+",
+                              "F1-RadGraph","BLEU-1","BLEU-4","ROUGE-L"]])
+    print("")
+
+    os.makedirs(output_dir, exist_ok=True)
+    main_results.to_csv(os.path.join(output_dir, "main.csv"))
+
+    if wandb:
+        wandb_results = {}
+        for metric in main_results.columns:
+            for idx in main_results.index:
+                k = f"{str(metric)}-{str(idx)}"
+                val = main_results.loc[idx, metric]
+                try:
+                    import numpy as _np
+                    if isinstance(val, (_np.floating, _np.integer)):
+                        val = val.item()
+                except Exception:
+                    pass
+                wandb_results[k] = val
+        wandb.init(name=run_name); wandb.log(wandb_results)
+
+    print("========== CheXbert F1 (uncertain as positive) ==========")
+    pd.DataFrame(results["breakdown+"])[sorted(CONDITIONS)+["micro avg","macro avg"]].T[
+        ['f1-score','precision','recall','support']
+    ].to_csv(os.path.join(output_dir, "breakdown_p.csv"), index=True)
+    print("Saved: breakdown_p.csv\n")
+
+    print("========== CheXbert F1 (uncertain as negative) ==========")
+    pd.DataFrame(results["breakdown-"])[sorted(CONDITIONS)+["micro avg","macro avg"]].T[
+        ['f1-score','precision','recall','support']
+    ].to_csv(os.path.join(output_dir, "breakdown_n.csv"), index=True)
+    print("Saved: breakdown_n.csv\n")
+
+    if report_chexbert_f1:
+        print("========== CheXbert F1 ==========")
+        print(pd.DataFrame(results["chexbert_metrics"])[sorted(CONDITIONS)+["avg"]].T[
+            ["positive f1","negation f1","uncertain f1","blank f1","weighted f1","kappas"]
+        ])
+
+if __name__ == "__main__":
+    import fire
+    fire.Fire(main)
