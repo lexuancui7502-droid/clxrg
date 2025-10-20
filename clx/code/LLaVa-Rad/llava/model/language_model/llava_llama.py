@@ -12,7 +12,6 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -42,6 +41,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaConfig
 
     def __init__(self, config):
+        # 保持与上游一致的初始化顺序
         super(LlamaForCausalLM, self).__init__(config)
         self.model = LlavaLlamaModel(config)
 
@@ -72,7 +72,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(input_ids, attention_mask, past_key_values, labels, images)
+        input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(
+            input_ids, attention_mask, past_key_values, labels, images
+        )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -136,5 +138,25 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         )
         return model_inputs
 
-AutoConfig.register("llava", LlavaConfig, exist_ok=True)
-AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
+
+# ========================= 注册到 Transformers Auto* =========================
+# [2025-10-17 修改] 适配 transformers==4.31.0：该版本的 AutoConfig.register 不支持 exist_ok 形参。
+#                  这里用 try/except 做向后兼容；若已注册过或老版本无该参数，则安全跳过。
+
+try:
+    # 新版 transformers（4.33+）支持 exist_ok
+    AutoConfig.register("llava", LlavaConfig, exist_ok=True)
+except TypeError:
+    # 老版（如 4.31.0）没有 exist_ok 参数
+    try:
+        AutoConfig.register("llava", LlavaConfig)
+    except Exception:
+        # 已注册等非关键异常——忽略
+        pass
+
+# [2025-10-17 修改] 为避免重复注册导致异常，这里也包一层保护。
+try:
+    AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)
+except Exception:
+    # 已注册过等情况——忽略
+    pass

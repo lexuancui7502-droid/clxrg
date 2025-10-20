@@ -1,3 +1,4 @@
+# 离线版本
 # """WIP"""
 
 # import json
@@ -207,7 +208,19 @@ import torch
 from timm.models.vision_transformer import VisionTransformer
 from transformers.modeling_outputs import BaseModelOutput
 
+
 from .utils import from_pretrained, remove_transformer_pooler_weights
+
+# [2025-10-17] 新增：本地优先路径 & 环境变量
+from pathlib import Path
+
+# [2025-10-17] 允许通过环境变量指定本地持久目录与具体文件
+# BIOMEDCLIP_CACHE：放 ckpt.json/ckpt.pt 的目录
+# BIOMEDCLIP_CKPT：ckpt 的绝对路径
+# LLAVARAD_VISION_CFG：biomedclipcxr_518.json 的绝对路径
+_BIOMEDCLIP_CACHE = os.environ.get("BIOMEDCLIP_CACHE", os.path.expanduser("~/.cache/biomed_clip"))
+_CKPT_ENV = os.environ.get("BIOMEDCLIP_CKPT", "")
+_CFG_ENV = os.environ.get("LLAVARAD_VISION_CFG", "")
 
 LLAVARAD_HF_REPO = "microsoft/llava-rad"
 
@@ -253,16 +266,51 @@ class OpenCLIPVisionTower(torch.nn.Module):
 
         self.is_loaded = False
 
+        # self.vision_tower_name = vision_tower
+        # if os.path.exists(vision_tower_config):
+        #     self.vision_tower_config = json.load(open(vision_tower_config))
+        # else:
+        #     # likely from hf hub
+        #     from huggingface_hub import hf_hub_download
+        #     cache_file = hf_hub_download(repo_id=LLAVARAD_HF_REPO, filename='biomedclipcxr_518.json')
+        #     self.vision_tower_config = json.load(open(cache_file))
+
+        # [2025-10-17] 改：加载配置时本地优先，否则从 Hub 下载
         self.vision_tower_name = vision_tower
-        if os.path.exists(vision_tower_config):
-            self.vision_tower_config = json.load(open(vision_tower_config))
+
+        _cfg_candidates = []
+        if vision_tower_config:                          # 1) 调用方显式传入
+            _cfg_candidates.append(vision_tower_config)
+        if _CFG_ENV:                                     # 2) 环境变量指向的绝对路径
+            _cfg_candidates.append(_CFG_ENV)
+        _cfg_candidates.append(                          # 3) 约定目录下的默认文件名
+            os.path.join(_BIOMEDCLIP_CACHE, "biomedclipcxr_518.json")
+        )
+
+        _cfg_path = next((p for p in _cfg_candidates if p and os.path.exists(p)), None)
+        if _cfg_path:
+            self.vision_tower_config = json.load(open(_cfg_path, "r"))
         else:
-            # likely from hf hub
+            # 4) 最后兜底到 Hub（会命中 HF_HOME 缓存，不会重复下）
             from huggingface_hub import hf_hub_download
             cache_file = hf_hub_download(repo_id=LLAVARAD_HF_REPO, filename='biomedclipcxr_518.json')
-            self.vision_tower_config = json.load(open(cache_file))
-            
-        self.vision_tower_checkpoint = vision_tower_checkpoint
+            self.vision_tower_config = json.load(open(cache_file, "r"))
+
+
+
+        # self.vision_tower_checkpoint = vision_tower_checkpoint
+
+        # [2025-10-17] 改：checkpoint 也先看本地（传参/环境变量/约定目录）
+        _ckpt_candidates = []
+        if vision_tower_checkpoint:
+            _ckpt_candidates.append(vision_tower_checkpoint)
+        if _CKPT_ENV:
+            _ckpt_candidates.append(_CKPT_ENV)
+        _ckpt_candidates.append(os.path.join(_BIOMEDCLIP_CACHE, "ckpt.pt"))
+
+        _ckpt_path = next((p for p in _ckpt_candidates if p and os.path.exists(p)), None)
+        self.vision_tower_checkpoint = _ckpt_path if _ckpt_path else vision_tower_checkpoint        
+
         self.select_layer = args.mm_vision_select_layer
         self.select_feature = getattr(args, 'mm_vision_select_feature', 'patch')
 
@@ -272,18 +320,35 @@ class OpenCLIPVisionTower(torch.nn.Module):
             self.cfg_only = vision_tower
         
     def load_model(self):
+        # if self.vision_tower_checkpoint:
+        #     if not os.path.exists(self.vision_tower_checkpoint):
+        #         print("Loading vision tower from HF Hub")
+        #         # this is probably from HF Hub
+        #         from huggingface_hub import hf_hub_download
+                
+        #         def load_from_hf(repo_id=LLAVARAD_HF_REPO, filename="",subfolder=None):
+        #             cache_file = hf_hub_download(repo_id=repo_id, filename=filename, subfolder=subfolder)
+        #             return cache_file
+        #         self.vision_tower_checkpoint = load_from_hf(filename=self.vision_tower_checkpoint)
+
+        #     self.vision_tower_checkpoint = remove_transformer_pooler_weights(self.vision_tower_checkpoint)
+
+
+        # [2025-10-17] 改：只有找不到本地 ckpt 才去 Hub；且用 basename 作为 Hub 文件名
         if self.vision_tower_checkpoint:
             if not os.path.exists(self.vision_tower_checkpoint):
-                print("Loading vision tower from HF Hub")
-                # this is probably from HF Hub
+                print("Loading vision tower from HF Hub (no local ckpt found)")
                 from huggingface_hub import hf_hub_download
-                
-                def load_from_hf(repo_id=LLAVARAD_HF_REPO, filename="",subfolder=None):
-                    cache_file = hf_hub_download(repo_id=repo_id, filename=filename, subfolder=subfolder)
-                    return cache_file
+        
+                def load_from_hf(repo_id=LLAVARAD_HF_REPO, filename="", subfolder=None):
+                    fname = os.path.basename(filename) if filename else "ckpt.pt"
+                    return hf_hub_download(repo_id=repo_id, filename=fname, subfolder=subfolder)
+        
                 self.vision_tower_checkpoint = load_from_hf(filename=self.vision_tower_checkpoint)
-
+        
             self.vision_tower_checkpoint = remove_transformer_pooler_weights(self.vision_tower_checkpoint)
+
+
         model, preprocess, _ = from_pretrained(
             self.vision_tower_name, self.vision_tower_config, self.vision_tower_checkpoint
         )

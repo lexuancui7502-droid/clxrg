@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.metrics import f1_score, confusion_matrix, classification_report
 from statsmodels.stats.inter_rater import cohens_kappa
 
-# [2024-10-16] 这里改成相对导入，避免用户直接运行脚本时报错
+# [2025-10-16] 这里改成相对导入，避免用户直接运行脚本时报错
 # from rrg_eval.factuality_utils import (
 #     load_mimic_cxr_expert_annotations,
 #     map_to_binary,

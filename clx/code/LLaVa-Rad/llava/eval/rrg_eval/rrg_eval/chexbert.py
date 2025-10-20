@@ -182,7 +182,13 @@ class CheXbert(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        # [2025-10-18] 稳健导入 tokenizer：
+        # self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        tok_dir = os.environ.get(
+            "CHEXBERT_TOKENIZER_DIR",
+            "/media/cuilexuan/clx/weights/hf_home/hub/models--bert-base-uncased/snapshots/local-copy"
+        )
+        self.tokenizer = BertTokenizer.from_pretrained(tok_dir, local_files_only=True)
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         # Load model
         model = bert_labeler()
