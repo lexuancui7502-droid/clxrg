@@ -24,6 +24,7 @@ from .multimodal_projector.builder import build_vision_projector
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
+# 这个类定义了多模态基础模型，结合视觉编码器和语言模型
 class LlavaMetaModel:
 
     # 模型初始化，构建视觉编码器和投影器
@@ -32,7 +33,7 @@ class LlavaMetaModel:
 
         if hasattr(config, "mm_vision_tower"):
             self.vision_tower = build_vision_tower(config, delay_load=True)         # 视觉编码器，提取图像特征  delay_load=True表示延迟加载，优化内存使用
-            self.mm_projector = build_vision_projector(config)              # 多模态投影器，将视觉特征映射到语言模型空间
+            self.mm_projector = build_vision_projector(config)                      # 多模态投影器，将视觉特征映射到语言模型空间
 
     # 获取视觉编码器实例
     def get_vision_tower(self):
@@ -43,15 +44,15 @@ class LlavaMetaModel:
 
     # 动态初始化视觉模块组件
     def initialize_vision_modules(self, model_args, fsdp=None):
-        vision_tower = model_args.vision_tower
-        mm_vision_select_layer = model_args.mm_vision_select_layer
-        mm_vision_select_feature = model_args.mm_vision_select_feature
-        pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
+        vision_tower = model_args.vision_tower                              # 获取视觉编码器类型或路径
+        mm_vision_select_layer = model_args.mm_vision_select_layer          # 获取视觉特征选择层
+        mm_vision_select_feature = model_args.mm_vision_select_feature      # 获取视觉特征选择方式
+        pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter        # 获取预训练投影器检查点路径
 
         # 配置视觉编码器参数
-        self.config.mm_vision_tower = vision_tower                  # 设置视觉编码器的类型
+        self.config.mm_vision_tower = vision_tower                                      # 设置视觉编码器的类型
         self.config.mm_vision_tower_config = model_args.vision_tower_config             # 存储视觉编码器的配置参数
-        self.config.mm_vision_tower_checkpoint = model_args.vision_tower_checkpoint
+        self.config.mm_vision_tower_checkpoint = model_args.vision_tower_checkpoint     # 存储视觉编码器的预训练检查点路径
 
         # 构建视觉编码器
         vision_tower = build_vision_tower(model_args)
@@ -63,17 +64,17 @@ class LlavaMetaModel:
             self.vision_tower = vision_tower
 
         # 配置投影器参数
-        self.config.use_mm_proj = True          # 启用多模态投影器，将视觉特征投影到文本空间
+        self.config.use_mm_proj = True                                      # 启用多模态投影器，将视觉特征投影到文本空间
         self.config.mm_projector_type = getattr(model_args, 'mm_projector_type', 'linear')          # 获取投影器类型
-        self.config.mm_hidden_size = vision_tower.hidden_size           # 设置投影器的输入维度为视觉编码器的输出维度
-        self.config.mm_vision_select_layer = mm_vision_select_layer
-        self.config.mm_vision_select_feature = mm_vision_select_feature
+        self.config.mm_hidden_size = vision_tower.hidden_size               # 设置投影器的输入维度为视觉编码器的输出维度
+        self.config.mm_vision_select_layer = mm_vision_select_layer         # 设置视觉特征选择层
+        self.config.mm_vision_select_feature = mm_vision_select_feature     # 设置视觉特征选择方式
 
         self.mm_projector = build_vision_projector(self.config)         # 构建多模态投影器
 
         # 加载预训练的投影器权重
         if pretrain_mm_mlp_adapter is not None:         # 支持从检查点加载预训练权重，加速收敛或保持性能
-            mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')          # 从指定路径加载权重文件到 CPU
+            mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')                  # 从指定路径加载权重文件到 CPU
             # 从完整的模型权重中提取投影器相关的权重
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}           # 去除前缀，匹配当前投影器的状态字典结构
@@ -82,34 +83,35 @@ class LlavaMetaModel:
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
 
+# 抽象基类，定义多模态因果语言模型的接口
 class LlavaMetaForCausalLM(ABC):
 
     @abstractmethod
-    def get_model(self):                    # 抽象方法，获取基础语言模型
+    def get_model(self):                        # 抽象方法，获取基础语言模型
         pass
 
     def get_vision_tower(self):                 # 获取视觉编码器
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images):                # 编码图像特征
-        image_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(image_features)
-        return image_features
+    def encode_images(self, images):            # 编码图像特征
+        image_features = self.get_model().get_vision_tower()(images)                # 提取图像特征
+        image_features = self.get_model().mm_projector(image_features)              # 将图像特征投影到语言模型空间
+        return image_features               # 返回投影后的图像特征
 
     def prepare_inputs_labels_for_multimodal(                   # 准备多模态输入和标签
         self, input_ids, attention_mask, past_key_values, labels, images
     ):
         vision_tower = self.get_vision_tower()
         # 输入验证和处理
-        if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            if past_key_values is not None and vision_tower is not None and images is not None and input_ids.shape[1] == 1:
+        if vision_tower is None or images is None or input_ids.shape[1] == 1:           # 如果没有视觉编码器或图像，或输入仅包含单个token，则不进行多模态处理
+            if past_key_values is not None and vision_tower is not None and images is not None and input_ids.shape[1] == 1:         # 仅在特定条件下调整注意力掩码
                 attention_mask = torch.ones((attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1), dtype=attention_mask.dtype, device=attention_mask.device)
-            return input_ids, attention_mask, past_key_values, None, labels
+            return input_ids, attention_mask, past_key_values, None, labels             # 继续进行多模态处理
 
         # 图像特征提取和分块
-        if type(images) is list or images.ndim == 5:
+        if type(images) is list or images.ndim == 5:        # 如果输入是图像列表或5维张量，则拼接所有图像 → 批量编码 → 按原始批次分割 → 展平特征
             # 处理多个图像样本
-            concat_images = torch.cat([image for image in images], dim=0)
+            concat_images = torch.cat([image for image in images], dim=0)       
             image_features = self.encode_images(concat_images)
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
@@ -118,12 +120,13 @@ class LlavaMetaForCausalLM(ABC):
             # 处理单个图像批次
             image_features = self.encode_images(images)
 
+        # 准备存储新的输入嵌入和标签
         new_input_embeds = []
         new_labels = [] if labels is not None else None
         cur_image_idx = 0
         # 多模态输入构建
-        for batch_idx, cur_input_ids in enumerate(input_ids):
-            if (cur_input_ids == IMAGE_TOKEN_INDEX).sum() == 0:
+        for batch_idx, cur_input_ids in enumerate(input_ids):               # 遍历每个样本的输入ID
+            if (cur_input_ids == IMAGE_TOKEN_INDEX).sum() == 0:             # 如果当前样本没有图像token，直接嵌入文本
                 # multimodal LLM, but the current sample is not multimodal
                 # FIXME: this is a hacky fix, for deepspeed zero3 to work
                 # 当前样本不包含图像token的特殊处理
@@ -144,11 +147,12 @@ class LlavaMetaForCausalLM(ABC):
                 cur_labels = labels[batch_idx]
                 cur_new_labels = []
                 assert cur_labels.shape == cur_input_ids.shape
+            # 将文本序列中的图像标记替换为实际的图像特征嵌入
             while image_token_indices.numel() > 0:
                 cur_image_features = image_features[cur_image_idx]
                 image_token_start = image_token_indices[0]
                 if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
-                    # 使用特殊起始/结束token的处理
+                    # 情况A：使用特殊起始/结束token的处理
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[:image_token_start-1]).detach())
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[image_token_start-1:image_token_start]))
                     cur_new_input_embeds.append(cur_image_features)
@@ -159,7 +163,7 @@ class LlavaMetaForCausalLM(ABC):
                         cur_new_labels.append(cur_labels[image_token_start:image_token_start+1])
                         cur_labels = cur_labels[image_token_start+2:]
                 else:
-                    # 标准处理：直接替换IMAGE_TOKEN_INDEX为图像特征
+                    # 情况B：标准处理，直接替换IMAGE_TOKEN_INDEX为图像特征
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[:image_token_start]))
                     cur_new_input_embeds.append(cur_image_features)
                     # 标签对齐处理
@@ -173,6 +177,7 @@ class LlavaMetaForCausalLM(ABC):
                 else:
                     cur_input_ids = cur_input_ids[image_token_start+1:]
                 image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0]
+            # 处理剩余的文本部分
             if cur_input_ids.numel() > 0:
                 if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids).detach())
@@ -186,17 +191,18 @@ class LlavaMetaForCausalLM(ABC):
             if labels is not None:
                 cur_new_labels = torch.cat(cur_new_labels, dim=0)
                 new_labels.append(cur_new_labels)
-        # 标签对齐处理
+        # 对齐批次中不同样本的长度
         if any(x.shape != new_input_embeds[0].shape for x in new_input_embeds):
             max_len = max(x.shape[0] for x in new_input_embeds)
 
-            # 对输入嵌入和标签进行填充对齐
+            # 对输入嵌入进行填充对齐
             new_input_embeds_align = []
             for cur_new_embed in new_input_embeds:
                 cur_new_embed = torch.cat((cur_new_embed, torch.zeros((max_len - cur_new_embed.shape[0], cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device)), dim=0)
                 new_input_embeds_align.append(cur_new_embed)
             new_input_embeds = torch.stack(new_input_embeds_align, dim=0)
 
+            # 对标签进行填充对齐
             if labels is not None:
                 new_labels_align = []
                 _new_labels = new_labels
@@ -205,6 +211,7 @@ class LlavaMetaForCausalLM(ABC):
                     new_labels_align.append(cur_new_label)
                 new_labels = torch.stack(new_labels_align, dim=0)
 
+            # 调整注意力掩码以匹配新的输入长度
             if attention_mask is not None:
                 new_attention_mask = []
                 for cur_attention_mask, cur_new_labels, cur_new_labels_align in zip(attention_mask, _new_labels, new_labels):
@@ -214,7 +221,7 @@ class LlavaMetaForCausalLM(ABC):
                     new_attention_mask.append(cur_new_attention_mask)
                 attention_mask = torch.stack(new_attention_mask, dim=0)
                 assert attention_mask.shape == new_labels.shape
-        else:
+        else:               # 序列长度一致时的简单处理：如果所有样本长度相同，直接堆叠
             new_input_embeds = torch.stack(new_input_embeds, dim=0)
             if labels is not None:
                 new_labels  = torch.stack(new_labels, dim=0)

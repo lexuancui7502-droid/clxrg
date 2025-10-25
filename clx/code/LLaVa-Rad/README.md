@@ -61,7 +61,7 @@ Follow these steps to set up LLaVA-Rad:
    ```
 
 ## Train
-
+# 需要两个模型的权重，分别是语言模型和图像编码器
 When starting from scratch, the following checkpoints are needed:
 - A pre-trained LM checkpoint, e.g., [lmsys/vicuna-7b-v1.5](https://huggingface.co/lmsys/vicuna-7b-v1.5)
 - By default, we use a customized domain-specific ViT, BiomedCLIP-CXR. See [README.md](./llava/model/multimodal_encoder/open_clip_encoder/README.md) for details.
@@ -70,7 +70,7 @@ When starting from scratch, the following checkpoints are needed:
 Before running the commands below, you need to have the data, image folder, and the above checkpoints ready. 
 
 **0.1 Data**
-
+# 要获取MIMIC-CXR注释数据
 To download the data, sign the data use agreement and follow the instructions for download at [LLaVA-Rad MIMIC-CXR Annotations on PhysioNet](https://physionet.org/content/llava-rad-mimic-cxr-annotation/1.0.0/). This will include reports with extracted sections in LLaVA format, split into train/dev/test.
 
 **0.2 Images**
@@ -86,15 +86,17 @@ You can find the pretrained model weights for BiomedCLIP-CXR and LLaVA-Rad at ht
 - Change the paths in the scripts below according to where you downloaded the data.
 - Batch size is set for 4-GPU machines. If your machine has a difference number of GPUs, please change batch size. Training commands have been tested on a single 80GB A100 and 4x80GB H100, using torch 2.4.1 and cuda 11.8 with flash attention 2.7.2.post1.
 
+# 1.预训练阶段，仅训练视觉-文本投影层，冻结视觉编码器与语言模型
 ### 1. Pretrain (Alignment)
 At this stage, we only train the projection layer (which aligns the vision features with text features). The vision encoder and LLM are all frozen.
 
 ```bash
 bash scripts/pretrain.sh
 ```
-
+# 输出：mm_projector.bin
 We get a pretrained projector `mm_projector.bin` after pretraining.
 
+# 2.微调阶段，加载上一步的投影层，对语言模型进行LoRA微调
 ### 2. Fine-tuning (LoRA)
 Once we have a pretrained projector, we can do fine-tuning. The command below fine-tunes the projector and LoRA of LLM:
 ```bash
@@ -102,7 +104,7 @@ bash scripts/finetune_lora.sh
 ```
 
 ## Inference
-
+# 推理，修改路径脚本后运行scripts/eval.sh
 Before running the command below, you need to change the script accordingly.
 
 ```bash

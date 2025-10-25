@@ -9,26 +9,29 @@ import requests
 
 from llava.constants import LOGDIR
 
-server_error_msg = "**NETWORK ERROR DUE TO HIGH TRAFFIC. PLEASE REGENERATE OR REFRESH THIS PAGE.**"
-moderation_msg = "YOUR INPUT VIOLATES OUR CONTENT MODERATION GUIDELINES. PLEASE TRY AGAIN."
+# 统一错误消息，避免硬编码。
+server_error_msg = "**NETWORK ERROR DUE TO HIGH TRAFFIC. PLEASE REGENERATE OR REFRESH THIS PAGE.**"                 # 高流量导致的网络错误提示
+moderation_msg = "YOUR INPUT VIOLATES OUR CONTENT MODERATION GUIDELINES. PLEASE TRY AGAIN."                         # 内容违规提示
 
 handler = None
 
 
+# 日志系统配置
 def build_logger(logger_name, logger_filename):
     global handler
 
+    # 定义日志格式（时间、日志级别、名称、消息）
     formatter = logging.Formatter(
         fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Set the format of root handlers
+    # Set the format of root handlers   初始化根日志处理器，并设置格式
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO)
     logging.getLogger().handlers[0].setFormatter(formatter)
 
-    # Redirect stdout and stderr to loggers
+    # Redirect stdout and stderr to loggers     将标准输出/错误重定向到日志系统，确保所有输出可追溯
     stdout_logger = logging.getLogger("stdout")
     stdout_logger.setLevel(logging.INFO)
     sl = StreamToLogger(stdout_logger, logging.INFO)
@@ -43,34 +46,37 @@ def build_logger(logger_name, logger_filename):
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
 
-    # Add a file handler for all loggers
+    # Add a file handler for all loggers    创建按天切割的日志文件
     if handler is None:
         os.makedirs(LOGDIR, exist_ok=True)
         filename = os.path.join(LOGDIR, logger_filename)
-        handler = logging.handlers.TimedRotatingFileHandler(
+        handler = logging.handlers.TimedRotatingFileHandler(            # 每天生成一个新日志文件
             filename, when='D', utc=True)
         handler.setFormatter(formatter)
 
         for name, item in logging.root.manager.loggerDict.items():
             if isinstance(item, logging.Logger):
-                item.addHandler(handler)
+                item.addHandler(handler)                                # 为所有已存在的日志器（Logger）添加文件处理器
 
     return logger
 
 
+# 流重定向类
 class StreamToLogger(object):
     """
     Fake file-like stream object that redirects writes to a logger instance.
     """
+    # 将流（如 sys.stdout）的写入操作重定向到日志器
     def __init__(self, logger, log_level=logging.INFO):
-        self.terminal = sys.stdout
-        self.logger = logger
-        self.log_level = log_level
+        self.terminal = sys.stdout                  # 保留原始终端输出
+        self.logger = logger                        # 目标日志器
+        self.log_level = log_level                  # 日志级别
         self.linebuf = ''
 
     def __getattr__(self, attr):
         return getattr(self.terminal, attr)
 
+    # 按行分割输入内容，完整行直接记录日志，不完整行暂存到 linebuf。确保跨平台换行符（\n）正确处理
     def write(self, buf):
         temp_linebuf = self.linebuf + buf
         self.linebuf = ''
@@ -85,12 +91,14 @@ class StreamToLogger(object):
             else:
                 self.linebuf += line
 
+    # 强制刷新缓冲区，确保所有内容被记录
     def flush(self):
         if self.linebuf != '':
             self.logger.log(self.log_level, self.linebuf.rstrip())
         self.linebuf = ''
 
 
+# 禁用 PyTorch 默认的权重初始化（如 Xavier/Glorot 初始化），减少模型加载时间
 def disable_torch_init():
     """
     Disable the redundant torch default initialization to accelerate model creation.
@@ -100,6 +108,7 @@ def disable_torch_init():
     setattr(torch.nn.LayerNorm, "reset_parameters", lambda self: None)
 
 
+# 调用 OpenAI 审核 API，检查文本是否包含违规内容（如暴力、仇恨言论）
 def violates_moderation(text):
     """
     Check whether the text violates OpenAI moderation API.
@@ -121,12 +130,14 @@ def violates_moderation(text):
     return flagged
 
 
+# ​​格式化输出信号量（Semaphore）的状态信息​​，以人类可读的字符串形式返回信号量的当前值和锁定状态
 def pretty_print_semaphore(semaphore):
     if semaphore is None:
         return "None"
     return f"Semaphore(value={semaphore._value}, locked={semaphore.locked()})"
 
 
+# 默认加载器，直接加载 JSON 文件，无额外处理
 def data_loader_default(data_path):
     logging.info("using the default loader.")
     dataset = json.load(open(data_path, "r"))
@@ -134,6 +145,7 @@ def data_loader_default(data_path):
     return dataset
 
 
+# 过滤只保留正位（AP/PA）胸片报告，跳过空内容
 def data_loader_mimic_cxr_all_frontal_findings(data_path):
     logging.info("using the MIMIC-CXR loader: all frontal findings.")
     with open(data_path) as f:
@@ -149,6 +161,7 @@ def data_loader_mimic_cxr_all_frontal_findings(data_path):
     return ret
 
 
+# 处理所有视角的胸片报告，动态生成提示词
 def data_loader_mimic_cxr_all_views_findings(data_path):
     logging.info("using the MIMIC-CXR loader: all views findings.")
     with open(data_path) as f:
@@ -165,6 +178,7 @@ def data_loader_mimic_cxr_all_views_findings(data_path):
     return ret
 
 
+# 根据检查原因（reason字段）生成定制化提示词，适配训练/测试集
 def data_loader_mimic_reason_findings(data_path, split):
     logging.info(f"using the MIMIC-CXR loader: MIMIC {split}.")
     with open(data_path) as f:
@@ -190,6 +204,7 @@ def data_loader_mimic_reason_findings(data_path, split):
     return ret
 
 
+# 通过字典映射不同数据加载策略，便于动态调用
 data_loaders = {
     "default": data_loader_default,
     "mimic_train_findings": lambda x: data_loader_mimic_reason_findings(x, "train"),

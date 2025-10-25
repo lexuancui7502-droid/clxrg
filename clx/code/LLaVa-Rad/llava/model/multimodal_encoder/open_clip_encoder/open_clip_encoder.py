@@ -218,48 +218,51 @@ from pathlib import Path
 # BIOMEDCLIP_CACHE：放 ckpt.json/ckpt.pt 的目录
 # BIOMEDCLIP_CKPT：ckpt 的绝对路径
 # LLAVARAD_VISION_CFG：biomedclipcxr_518.json 的绝对路径
-_BIOMEDCLIP_CACHE = os.environ.get("BIOMEDCLIP_CACHE", os.path.expanduser("~/.cache/biomed_clip"))
-_CKPT_ENV = os.environ.get("BIOMEDCLIP_CKPT", "")
-_CFG_ENV = os.environ.get("LLAVARAD_VISION_CFG", "")
+_BIOMEDCLIP_CACHE = os.environ.get("BIOMEDCLIP_CACHE", os.path.expanduser("~/.cache/biomed_clip"))          # 默认缓存目录
+_CKPT_ENV = os.environ.get("BIOMEDCLIP_CKPT", "")                     # 具体 checkpoint 路径    
+_CFG_ENV = os.environ.get("LLAVARAD_VISION_CFG", "")                  # 具体配置路径
 
-LLAVARAD_HF_REPO = "microsoft/llava-rad"
+LLAVARAD_HF_REPO = "microsoft/llava-rad"            # Hugging Face Hub 仓库名
 
+# 核心视觉编码器包装器
 class VisionTower(torch.nn.Module):
 
-    def __init__(self, vit: VisionTransformer) -> None:
+    def __init__(self, vit: VisionTransformer) -> None:             # 初始化视觉塔，接受一个 VisionTransformer 实例
         super().__init__()
         self.vit = vit
         self.hidden_size = vit.embed_dim
         self.num_patches = vit.patch_embed.num_patches
 
     @torch.no_grad()
-    def forward(self, images, output_hidden_states=True):
-        hidden_states = self.vit.patch_embed(images)
-        hidden_states = self.vit._pos_embed(hidden_states)
-        hidden_states = self.vit.norm_pre(hidden_states)
-        block_states = [hidden_states]
-        for block in self.vit.blocks:
+    def forward(self, images, output_hidden_states=True):           # 向前传播
+        hidden_states = self.vit.patch_embed(images)                # 对输入图像进行patch嵌入
+        hidden_states = self.vit._pos_embed(hidden_states)          # 添加位置嵌入
+        hidden_states = self.vit.norm_pre(hidden_states)            # 归一化输入
+        block_states = [hidden_states]                              # 存储每个块的隐藏状态
+        for block in self.vit.blocks:                               # 遍历视觉Transformer的每个块
             hidden_states = block(hidden_states)
             block_states.append(hidden_states)
-        if output_hidden_states:
+        if output_hidden_states:                                    # 如果需要输出隐藏状态，返回所有块的状态
             return BaseModelOutput(
                 last_hidden_state=hidden_states, hidden_states=block_states
             )
-        else:
+        else:                                                      # 否则只返回最后的隐藏状态
             return BaseModelOutput(last_hidden_state=hidden_states)
 
 
+# 图像预处理包装器
 class Processor:
 
     def __init__(self, fn) -> None:
         self.fn = fn
 
-    def preprocess(self, image, return_tensors="pt"):
+    def preprocess(self, image, return_tensors="pt"):           # 统一预处理接口，兼容Hugging Face的处理器格式
         if return_tensors != "pt":
             raise NotImplementedError
         return {"pixel_values": [self.fn(image)]}
 
 
+# 基于 OpenCLIP 的视觉特征提取器，将输入的医学图像转换为模型可以理解的视觉特征表示
 class OpenCLIPVisionTower(torch.nn.Module):
     def __init__(self, vision_tower, args, delay_load=False, vision_tower_config=None, vision_tower_checkpoint=None):
         super().__init__()
@@ -278,6 +281,7 @@ class OpenCLIPVisionTower(torch.nn.Module):
         # [2025-10-17] 改：加载配置时本地优先，否则从 Hub 下载
         self.vision_tower_name = vision_tower
 
+        # 配置加载优先级：
         _cfg_candidates = []
         if vision_tower_config:                          # 1) 调用方显式传入
             _cfg_candidates.append(vision_tower_config)
@@ -300,7 +304,7 @@ class OpenCLIPVisionTower(torch.nn.Module):
 
         # self.vision_tower_checkpoint = vision_tower_checkpoint
 
-        # [2025-10-17] 改：checkpoint 也先看本地（传参/环境变量/约定目录）
+        # [2025-10-17] 改：checkpoint（检查点） 也先看本地（传参/环境变量/约定目录）
         _ckpt_candidates = []
         if vision_tower_checkpoint:
             _ckpt_candidates.append(vision_tower_checkpoint)
@@ -318,7 +322,8 @@ class OpenCLIPVisionTower(torch.nn.Module):
             self.load_model()
         else:
             self.cfg_only = vision_tower
-        
+
+    # 模型加载方法    
     def load_model(self):
         # if self.vision_tower_checkpoint:
         #     if not os.path.exists(self.vision_tower_checkpoint):
@@ -359,6 +364,7 @@ class OpenCLIPVisionTower(torch.nn.Module):
 
         self.is_loaded = True
 
+    # 特征选择方法
     def feature_select(self, image_forward_outs):
         image_features = image_forward_outs.hidden_states[self.select_layer]
         if self.select_feature == 'patch':
@@ -369,6 +375,7 @@ class OpenCLIPVisionTower(torch.nn.Module):
             raise ValueError(f'Unexpected select feature: {self.select_feature}')
         return image_features
 
+    # 向前传播方法
     @torch.no_grad()
     def forward(self, images):
         if type(images) is list:
@@ -385,26 +392,26 @@ class OpenCLIPVisionTower(torch.nn.Module):
 
     @property
     def dummy_feature(self):
-        return torch.zeros(1, self.hidden_size, device=self.device, dtype=self.dtype)
+        return torch.zeros(1, self.hidden_size, device=self.device, dtype=self.dtype)           # 创建虚拟特征，用于模型初始化或测试
 
     @property
     def dtype(self):
-        return next(self.vision_tower.parameters()).dtype
+        return next(self.vision_tower.parameters()).dtype           # 模型数据类型
 
     @property
     def device(self):
-        return next(self.vision_tower.parameters()).device
+        return next(self.vision_tower.parameters()).device          # 模型所在设备
 
     @property
     def config(self):
-        raise NotImplementedError
+        raise NotImplementedError                           # 配置属性，暂未实现
 
     @property
     def hidden_size(self):
-        return self.vision_tower.hidden_size
+        return self.vision_tower.hidden_size                # 视觉特征的隐藏层大小，即特征维度
 
     @property
     def num_patches(self):
-        return self.vision_tower.num_patches
+        return self.vision_tower.num_patches                # 计算图像中的patch补丁数量
 
     

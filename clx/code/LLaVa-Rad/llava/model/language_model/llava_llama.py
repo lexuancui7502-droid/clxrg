@@ -26,26 +26,29 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
 
-class LlavaConfig(LlamaConfig):
+class LlavaConfig(LlamaConfig):                 # 继承LLaMA配置，定义LLaVA模型类型
     model_type = "llava"
 
 
-class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
+class LlavaLlamaModel(LlavaMetaModel, LlamaModel):                  # 组合视觉和语言能力，继承自LLaMA模型。LlamaModel: 提供文本理解能力；LlavaMetaModel: 提供多模态融合能力
     config_class = LlavaConfig
 
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
 
 
+# 语言生成模型，负责端到端的训练和推理。继承自 LlamaForCausalLM（纯文本生成模型）和 LlavaMetaForCausalLM（多模态支持）
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaConfig
 
     def __init__(self, config):
         # 保持与上游一致的初始化顺序
-        super(LlamaForCausalLM, self).__init__(config)
-        self.model = LlavaLlamaModel(config)
+        super(LlamaForCausalLM, self).__init__(config)          # 跳过一级初始化
+        self.model = LlavaLlamaModel(config)                    # 使用LLaVA模型替换原有的LLaMA模型
 
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+         # 重定义语言模型头，以适应LLaVA的需求
+
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)         # 语言模型头：将隐藏状态映射到词汇表大小的线性层
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -53,7 +56,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
 
-    def forward(
+    def forward(                # 定义前向传播逻辑，处理多模态输入（文本 + 图像）并计算损失或生成预测。
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -65,18 +68,19 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    ) -> Union[Tuple, CausalLMOutputWithPast]:                  # 定义模型的前向传播逻辑，处理多模态输入（文本 + 图像）并生成预测结果
+        # 参数默认值处理​，如果参数未显式传入，则使用模型配置中的默认值。
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions       # 设置是否输出注意力权重
+        output_hidden_states = (                            # 设置是否输出隐藏状态
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states              # 如果未指定，则使用配置中的默认值
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict                           # 设置是否返回字典形式的输出
 
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(
+        input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(  # 将文本和图像输入融合为模型可处理的格式
             input_ids, attention_mask, past_key_values, labels, images
         )
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)     调用模型主体计算隐藏状态、注意力权重等
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -87,15 +91,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
         )
-
+        # 提取隐藏状态并通过 lm_head计算词汇表logits分数
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
 
         loss = None
-        if labels is not None:
+        if labels is not None:              # 计算交叉熵损失，对齐预测和标签（标准语言模型训练方式）
             # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            shift_logits = logits[..., :-1, :].contiguous()         # 预测n的logits（去掉最后一个token）
+            shift_labels = labels[..., 1:].contiguous()             # 真实标签（去掉第一个token）
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
@@ -108,7 +112,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return CausalLMOutputWithPast(          # 返回结构化输出（损失、logits、KV缓存等）
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -116,19 +120,19 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             attentions=outputs.attentions,
         )
 
-    def prepare_inputs_for_generation(
+    def prepare_inputs_for_generation(                  # 在生成任务（如自回归生成）中动态准备输入数据。
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
-        if past_key_values:
+        if past_key_values:                     # 使用KV缓存时，只需传递最新生成的token
             input_ids = input_ids[:, -1:]
 
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step 优先使用 inputs_embeds（首次生成），否则用 input_ids
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             model_inputs = {"input_ids": input_ids}
 
-        model_inputs.update(
+        model_inputs.update(                # 更新输入字典，包括KV缓存、图像数据和其他生成参数
             {
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
@@ -142,6 +146,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 # ========================= 注册到 Transformers Auto* =========================
 # [2025-10-17 修改] 适配 transformers==4.31.0：该版本的 AutoConfig.register 不支持 exist_ok 形参。
 #                  这里用 try/except 做向后兼容；若已注册过或老版本无该参数，则安全跳过。
+# 注册​​指将自定义的​​模型类​​或​​配置类​​添加到全局的自动映射系统中
 
 try:
     # 新版 transformers（4.33+）支持 exist_ok

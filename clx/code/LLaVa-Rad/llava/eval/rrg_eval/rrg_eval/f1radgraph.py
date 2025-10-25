@@ -11,6 +11,7 @@ from radgraph import RadGraph
 # =========================
 # 全局保险：ModuleDict 回退
 # =========================
+# [2025-10-19] 针对 radgraph 里 ModuleDict 键名不一致问题做兜底，
 if not hasattr(nn.ModuleDict, "_f1radgraph_orig_getitem"):
     nn.ModuleDict._f1radgraph_orig_getitem = nn.ModuleDict.__getitem__
 
@@ -34,6 +35,7 @@ if not hasattr(nn.ModuleDict, "_f1radgraph_orig_getitem"):
     nn.ModuleDict.__getitem__ = _f1radgraph_fallback_getitem
 
 # ------------------ 小工具：递归解包与安全 getattr ------------------
+# [2025-10-19] 递归解包 AllenNLP/自定义 TimeDistributed 等包装器，这是为了能够访问到实际的子模块，从而对其属性进行修改。
 def _unwrap(obj):
     """递归解包 AllenNLP/自定义 TimeDistributed 等包装器，直到取得真实子模块。"""
     seen = set()
@@ -58,6 +60,7 @@ def _has(obj, name):
         return False
 
 # -------- 配置：子模块及其关注的 label 后缀 --------
+# [2025-10-19] 需要处理的子模块及其关注的 label 后缀列表
 _SUBSPECS = {
     "_ner":      ("radgraph__ner_labels",      ("ner_labels",)),
     "ner":       ("radgraph__ner_labels",      ("ner_labels",)),
@@ -204,6 +207,7 @@ def _alias_all_matching_containers(submod, suffixes: Tuple[str, ...]):
             if any((k == suf or k.endswith(f"__{suf}")) for k in ks):
                 _three_way_alias(c, suf)
 
+# [2025-10-19] 选择真实存在的 key（radgraph__suffix -> *__suffix -> suffix -> 唯一键 -> 第一个）
 def _pick_existing_key_for_suffix(container, suffix: str) -> Optional[str]:
     """为 suffix 选择一个真实存在的 key（radgraph__suffix -> *__suffix -> suffix -> 唯一键 -> 第一个）。"""
     if container is None or not isinstance(container, (dict, nn.ModuleDict)):
@@ -246,6 +250,7 @@ def _set_namespace_attrs(submod, ns_full: Optional[str], label_suffixes: Tuple[s
             except Exception:
                 pass
 
+# [2025-10-19] 强制设置 namespace 与 active_key
 def _force_ns_and_activekey(submod, default_full_ns: str, suffixes: Tuple[str, ...]):
     """容器与 vocab 三向别名 -> 选择真实 key -> 写回 active/label/namespace。"""
     _alias_all_matching_containers(submod, suffixes)
@@ -294,6 +299,7 @@ def _looks_like_target_module(m):
     return False
 
 # =============== pre-hook，在 forward 调用前“就地修复” =================
+# [2025-10-19] 在 forward 前做修复，防止某些动态场景下仍报 KeyError。
 def _install_forward_pre_hook(u, default_full_ns: str, suffixes: Tuple[str, ...]):
     if hasattr(u, "_f1radgraph_pre_hook_installed"):
         return

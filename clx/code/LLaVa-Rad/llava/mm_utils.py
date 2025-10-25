@@ -9,10 +9,12 @@ from transformers import StoppingCriteria
 from llava.constants import IMAGE_TOKEN_INDEX
 
 
+# 将Base64编码的图像字符串解码为PIL.Image对象
 def load_image_from_base64(image):
     return Image.open(BytesIO(base64.b64decode(image)))
 
 
+# 将图像填充为正方形
 def expand2square(pil_img, background_color):
     width, height = pil_img.size
     if width == height:
@@ -27,6 +29,7 @@ def expand2square(pil_img, background_color):
         return result
 
 
+# 批量处理图像（填充+标准化），适配模型输入
 def process_images(images, image_processor, model_cfg):
     image_aspect_ratio = getattr(model_cfg, "image_aspect_ratio", None)
     new_images = []
@@ -41,11 +44,11 @@ def process_images(images, image_processor, model_cfg):
         new_images = torch.stack(new_images, dim=0)
     return new_images
 
-
+# 将含 <image>标记的文本转换为Token ID序列，标记图像嵌入位置
 def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
     prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split('<image>')]
 
-    def insert_separator(X, sep):
+    def insert_separator(X, sep):           # 用 insert_separator插入图像标记ID
         return [ele for sublist in zip(X, [sep]*len(X)) for ele in sublist][:-1]
 
     input_ids = []
@@ -64,6 +67,7 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
     return input_ids
 
 
+# 从路径中提取模型名称
 def get_model_name_from_path(model_path):
     model_path = model_path.strip("/")
     model_paths = model_path.split("/")
@@ -75,6 +79,7 @@ def get_model_name_from_path(model_path):
         return model_paths[-1]
 
 
+# 带重试机制的图像加载，避免因临时IO错误失败
 def open_image_with_retry(image_path, retries: int = 10):
     image = None
     while image is None and retries > 0:
@@ -88,6 +93,7 @@ def open_image_with_retry(image_path, retries: int = 10):
     return image
 
 
+# 检测生成文本是否包含关键词（如停止词），触发停止生成
 class KeywordsStoppingCriteria(StoppingCriteria):
     def __init__(self, keywords, tokenizer, input_ids):
         self.keywords = keywords
@@ -103,6 +109,7 @@ class KeywordsStoppingCriteria(StoppingCriteria):
         self.tokenizer = tokenizer
         self.start_len = input_ids.shape[1]
 
+    # 将关键词转换为Token ID序列，移除可能的BOS Token
     def __call__(self, output_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
         assert output_ids.shape[0] == 1, "Only support batch size 1 (yet)"  # TODO
         offset = min(output_ids.shape[1] - self.start_len, self.max_keyword_len)
