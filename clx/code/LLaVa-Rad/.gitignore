@@ -29,3 +29,4 @@ ckpts*
 
 .ipynb_checkpoints
 *.ipynb
+Radgraph/pycocoevalcap/physionet.org/files/radgraph/1.0.0/models/model_checkpoint/model.tar.gz
