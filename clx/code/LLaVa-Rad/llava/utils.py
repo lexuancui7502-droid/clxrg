@@ -203,6 +203,76 @@ def data_loader_mimic_reason_findings(data_path, split):
     logging.info(f"loaded {len(ret)}/{len(dataset)} samples.")
     return ret
 
+# [2025-11-17] 读取多视角json的数据加载函数
+def data_loader_mimic_multiview_findings(data_path):
+    """
+    Loader for your new multiview JSON.
+
+    Phase 2：真正保留多视角信息，让 Dataset 去加载多张图。
+    这里把 image 统一成 list[str]，后面 __getitem__ 再把它变成 (N_view, 3, H, W)。
+    """
+    logging.info("使用 MIMIC-CXR multiview loader（保留所有视角）.")
+    with open(data_path, "r") as f:
+        dataset = json.load(f)
+
+    ret = []
+    for d in dataset:
+        # 1) 跟其它 loader 一样，跳过空 findings
+        if not isinstance(d["conversations"][1]["value"], str):
+            continue
+
+        # 2) 处理 image 字段：可能是 str，也可能是 list[str]
+        img_field = d.get("image", None)
+        if img_field is None:
+            continue
+
+        if isinstance(img_field, list):
+            img_list = img_field
+        elif isinstance(img_field, str):
+            img_list = [img_field]
+        else:
+            # 非法格式直接丢掉
+            continue
+
+        # 去掉每个路径前面的 "mimic/" 前缀（和原 loader 行为保持一致）
+        clean_list = []
+        for p in img_list:
+            # if isinstance(p, str) and p.startswith("mimic/"):
+            #     p = p[len("mimic/"):]
+            # 11月17日晚赵一帆新增代码START
+            if isinstance(p, str) and p.startswith("mimic/"):
+                p = p[len("mimic/"):]
+            elif p.startswith("/"):
+                p = p[1:]
+            # 11月17日晚赵一帆新增代码END
+            clean_list.append(p)
+
+        # ★ 关键：现在 d["image"] 是一个 list[str]
+        d["image"] = clean_list
+
+        # 3) prompt：可以沿用你原来的，也可以像 reason loader 那样拼。
+        reason = d.get("reason", None)
+        if reason is not None:
+            reason = reason.replace("\n", " ")
+            d["conversations"][0]["value"] = (
+                "<image>\nProvide a description of the findings in the radiology image "
+                f"given the following indication: {reason}"
+            )
+        else:
+            # 如果你原 json 里的人类 prompt 已经是你想要的，也可以保留：
+            d["conversations"][0]["value"] = d["conversations"][0].get(
+                "value",
+                "<image>\nDescribe the findings of the chest x-ray.\n",
+            )
+
+        ret.append(d)
+
+    logging.info(
+        f"loaded {len(ret)}/{len(dataset)} multiview samples "
+        f"(each sample has len(d['image']) views)."
+    )
+    return ret
+
 
 # 通过字典映射不同数据加载策略，便于动态调用
 data_loaders = {
@@ -211,4 +281,5 @@ data_loaders = {
     "mimic_test_findings": lambda x: data_loader_mimic_reason_findings(x, "test"),
     "mimic_cxr_all_frontal_findings": data_loader_mimic_cxr_all_frontal_findings,
     "mimic_cxr_all_views_findings": data_loader_mimic_cxr_all_views_findings,
+    "mimic_multiview_findings": data_loader_mimic_multiview_findings,           # [2025-11-17] 新增加载多视角数据的模块
 }

@@ -73,6 +73,7 @@ class ModelArguments:           # 控制模型选择与结构级别的多模态�
     mm_vision_select_feature: Optional[str] = field(default="patch")            # 多模态视觉特征选择方式，默认 "patch"（补丁特征）
 
 
+# 多视角数据集加载会涉及到DataArguments类
 # 数据/加载相关参数，包括 data_path、loader、是否 lazy_preprocess、是否 multimodal、image_folder、图像相关配置等
 @dataclass
 class DataArguments:                        # 控制数据集加载与预处理选项
@@ -658,6 +659,7 @@ def preprocess(
     return dict(input_ids=input_ids, labels=targets)
 
 
+# 多视角数据集加载涉及到LazySupervisedDataset(Dataset)
 # 数据集类，支持“懒加载”与预处理，能把每条样本转为 input_ids、labels，并在需要时读取/处理图像（open_image_with_retry），为多模态训练准备数据结构。
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
@@ -693,57 +695,98 @@ class LazySupervisedDataset(Dataset):
             length_list.append(cur_len)
         return length_list
 
+    # [2025-11-17] 将原本的单视角替换为多视角版本
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+
+        # ---------- ① 处理图像（支持多视角） ----------
         if 'image' in sources[0]:
-            image_file = self.list_data_dict[i]['image']
+            img_field = self.list_data_dict[i]['image']      # 可能是 str 或 list[str]
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
-            image = open_image_with_retry(os.path.join(image_folder, image_file))
-            if image is None:
-                logging.error("Use an empty image.")
-                image = Image.new('RGB', (224, 224), tuple(int(x*255) for x in processor.image_mean))
-            if self.data_args.image_aspect_ratio == 'pad':
-                def expand2square(pil_img, background_color):
-                    width, height = pil_img.size
-                    if width == height:
-                        return pil_img
-                    elif width > height:
-                        result = Image.new(pil_img.mode, (width, width), background_color)
-                        result.paste(pil_img, (0, (width - height) // 2))
-                        return result
-                    else:
-                        result = Image.new(pil_img.mode, (height, height), background_color)
-                        result.paste(pil_img, ((height - width) // 2, 0))
-                        return result
-                image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
-                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+
+            # 统一为 list[str]
+            if isinstance(img_field, list):
+                img_list = img_field
             else:
-                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                img_list = [img_field]
+
+            pil_images = []
+            for img_rel_path in img_list:
+                img_path = os.path.join(image_folder, img_rel_path)
+                img = open_image_with_retry(img_path)
+                if img is None:
+                    logging.error(f"Use an empty image for {img_path}.")
+                    img = Image.new(
+                        'RGB',
+                        (224, 224),
+                        tuple(int(x * 255) for x in processor.image_mean),
+                    )
+                pil_images.append(img)
+
+            # 逐视角做 pad + preprocess，然后 stack 成 (N_view, 3, H, W)
+            proc_tensors = []
+            for img in pil_images:
+                if self.data_args.image_aspect_ratio == 'pad':
+                    def expand2square(pil_img, background_color):
+                        width, height = pil_img.size
+                        if width == height:
+                            return pil_img
+                        elif width > height:
+                            result = Image.new(pil_img.mode, (width, width), background_color)
+                            result.paste(pil_img, (0, (width - height) // 2))
+                            return result
+                        else:
+                            result = Image.new(pil_img.mode, (height, height), background_color)
+                            result.paste(pil_img, ((height - width) // 2, 0))
+                            return result
+
+                    img = expand2square(
+                        img,
+                        tuple(int(x * 255) for x in processor.image_mean),
+                    )
+
+                img_tensor = processor.preprocess(
+                    img, return_tensors='pt'
+                )['pixel_values'][0]      # (3, H, W)
+                proc_tensors.append(img_tensor)
+
+            # ★ 核心：一个 sample 的 image 现在是 (N_view, 3, H, W)
+            image = torch.stack(proc_tensors, dim=0)
+
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
-                self.data_args)
+                self.data_args,
+            )
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
+
+        # ---------- ② 文本 token 处理 ----------
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+            has_image=('image' in self.list_data_dict[i])
+        )
         if isinstance(i, int):
-            data_dict = dict(input_ids=data_dict["input_ids"][0],
-                             labels=data_dict["labels"][0])
+            data_dict = dict(
+                input_ids=data_dict["input_ids"][0],
+                labels=data_dict["labels"][0],
+            )
 
-        # image exist in the data
+        # ---------- ③ 把 image 塞进 data_dict ----------
         if 'image' in self.list_data_dict[i]:
-            data_dict['image'] = image
+            data_dict['image'] = image          # (N_view, 3, H, W)
         elif self.data_args.is_multimodal:
-            # image does not exist in the data, but the model is multimodal
+            # image 不存在但模型是多模态 → 填一个 dummy
             crop_size = self.data_args.image_processor.crop_size
-            data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+            data_dict['image'] = torch.zeros(
+                3, crop_size['height'], crop_size['width']
+            )
         return data_dict
+
 
 
 # 用来把多条样本拼成 batch（pad input_ids、pad labels 用 IGNORE_INDEX、构建 attention_mask、处理 images 的 stack/非一致 shape 情况）

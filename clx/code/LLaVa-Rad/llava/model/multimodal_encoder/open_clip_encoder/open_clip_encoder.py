@@ -222,6 +222,12 @@ _BIOMEDCLIP_CACHE = os.environ.get("BIOMEDCLIP_CACHE", os.path.expanduser("~/.ca
 _CKPT_ENV = os.environ.get("BIOMEDCLIP_CKPT", "")                     # 具体 checkpoint 路径    
 _CFG_ENV = os.environ.get("LLAVARAD_VISION_CFG", "")                  # 具体配置路径
 
+# [2025-11-18] 一些默认值，放在文件顶部合适的位置
+_DEFAULT_IMAGE_SIZE = 518  # BiomedCLIP-CXR 默认输入 518x518
+_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
+_DEFAULT_STD  = (0.26862954, 0.26130258, 0.27577711)
+
+
 LLAVARAD_HF_REPO = "microsoft/llava-rad"            # Hugging Face Hub 仓库名
 
 # 核心视觉编码器包装器
@@ -249,17 +255,41 @@ class VisionTower(torch.nn.Module):
         else:                                                      # 否则只返回最后的隐藏状态
             return BaseModelOutput(last_hidden_state=hidden_states)
 
-
+# [2025-11-18] 修改了Process里的几乎所有内容
 # 图像预处理包装器
 class Processor:
 
-    def __init__(self, fn) -> None:
-        self.fn = fn
+    def __init__(self, transform, image_size, mean=None, std=None):
+        self.transform = transform
+        self.image_size = image_size
 
-    def preprocess(self, image, return_tensors="pt"):           # 统一预处理接口，兼容Hugging Face的处理器格式
+        # 原来的字段
+        self.mean = mean
+        self.std = std
+
+        # 额外兼容 HF ImageProcessor 接口（给 LazySupervisedDataset 用）
+        self.image_mean = mean
+        self.image_std = std
+        self.crop_size = {
+            "height": image_size,
+            "width": image_size,
+        }
+
+    def __call__(self, image):
+        """保持原有用法：processor(image) -> tensor"""
+        return self.transform(image)
+
+    def preprocess(self, images, return_tensors="pt"):
+        """兼容 HF ImageProcessor 接口：支持单图 / 多图"""
         if return_tensors != "pt":
-            raise NotImplementedError
-        return {"pixel_values": [self.fn(image)]}
+            raise NotImplementedError("Only return_tensors='pt' is supported.")
+
+        # 支持传单张 PIL 或列表
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+
+        tensors = [self.transform(img) for img in images]  # 每个张量 [3, H, W]
+        return {"pixel_values": torch.stack(tensors, dim=0)}  # [N, 3, H, W]
 
 
 # 基于 OpenCLIP 的视觉特征提取器，将输入的医学图像转换为模型可以理解的视觉特征表示
@@ -354,10 +384,23 @@ class OpenCLIPVisionTower(torch.nn.Module):
             self.vision_tower_checkpoint = remove_transformer_pooler_weights(self.vision_tower_checkpoint)
 
 
+        # model, preprocess, _ = from_pretrained(
+        #     self.vision_tower_name, self.vision_tower_config, self.vision_tower_checkpoint
+        # )
+        # self.image_processor = Processor(preprocess)
+        # [2025-11-18] 构造 image_processor 时多传一个 image_size
         model, preprocess, _ = from_pretrained(
-            self.vision_tower_name, self.vision_tower_config, self.vision_tower_checkpoint
+        self.vision_tower_name, self.vision_tower_config, self.vision_tower_checkpoint
         )
-        self.image_processor = Processor(preprocess)
+
+        # 尝试从 config 里读 image_size，如果拿不到就用 518
+        image_size = self.vision_tower_config.get("image_size", None)
+        if image_size is None and "vision_cfg" in self.vision_tower_config:
+            image_size = self.vision_tower_config["vision_cfg"].get("image_size", _DEFAULT_IMAGE_SIZE)
+        if image_size is None:
+            image_size = _DEFAULT_IMAGE_SIZE
+
+        self.image_processor = Processor(preprocess, image_size=image_size)
 
         self.vision_tower = VisionTower(model.visual.trunk)
         self.vision_tower.requires_grad_(False)

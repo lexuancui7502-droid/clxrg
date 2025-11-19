@@ -93,10 +93,44 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):                 # 获取视觉编码器
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images):            # 编码图像特征
-        image_features = self.get_model().get_vision_tower()(images)                # 提取图像特征
-        image_features = self.get_model().mm_projector(image_features)              # 将图像特征投影到语言模型空间
-        return image_features               # 返回投影后的图像特征
+    # def encode_images(self, images):            # 编码图像特征
+    #     image_features = self.get_model().get_vision_tower()(images)                # 提取图像特征
+    #     image_features = self.get_model().mm_projector(image_features)              # 将图像特征投影到语言模型空间
+    #     return image_features               # 返回投影后的图像特征
+
+    # [2025-11-18] 统一处理图像 -> 视觉塔 -> 投影器 的 dtype / device
+    def encode_images(self, images):
+        """
+        统一处理图像 -> 视觉塔 -> 投影器 的 dtype / device，
+        避免 mat1 / mat2 dtype 不一致的问题。
+        """
+        model = self.get_model()
+        vision_tower = model.get_vision_tower()
+        projector = model.mm_projector
+
+        # 1. 把图片丢到视觉塔所在的 device / dtype 上
+        #    （防止出现 images 在 CPU、vision_tower 在 CUDA 之类的问题）
+        vt_params = list(vision_tower.parameters())
+        if len(vt_params) > 0:
+            vt_device = vt_params[0].device
+            vt_dtype = vt_params[0].dtype
+            images = images.to(device=vt_device, dtype=vt_dtype)
+
+        # 2. 先过视觉塔，拿到 patch 特征
+        image_features = vision_tower(images)   # (B_or_sumV, N_patch, D_vt)
+
+        # 3. 再把特征 cast 到 projector 的 dtype 上
+        proj_params = list(projector.parameters())
+        if len(proj_params) > 0:
+            proj_dtype = proj_params[0].dtype
+            if image_features.dtype != proj_dtype:
+                image_features = image_features.to(dtype=proj_dtype)
+
+        # 4. 过 mm_projector：映射到语言模型空间
+        image_features = projector(image_features)   # (B_or_sumV, N_patch, D_lm)
+
+        return image_features
+
 
     def prepare_inputs_labels_for_multimodal(                   # 准备多模态输入和标签
         self, input_ids, attention_mask, past_key_values, labels, images
@@ -109,15 +143,41 @@ class LlavaMetaForCausalLM(ABC):
             return input_ids, attention_mask, past_key_values, None, labels             # 继续进行多模态处理
 
         # 图像特征提取和分块
-        if type(images) is list or images.ndim == 5:        # 如果输入是图像列表或5维张量，则拼接所有图像 → 批量编码 → 按原始批次分割 → 展平特征
-            # 处理多个图像样本
-            concat_images = torch.cat([image for image in images], dim=0)       
-            image_features = self.encode_images(concat_images)
-            split_sizes = [image.shape[0] for image in images]
-            image_features = torch.split(image_features, split_sizes, dim=0)
-            image_features = [x.flatten(0, 1) for x in image_features]
+        # if type(images) is list or images.ndim == 5:        # 如果输入是图像列表或5维张量，则拼接所有图像 → 批量编码 → 按原始批次分割 → 展平特征
+        #     # 处理多个图像样本
+        #     concat_images = torch.cat([image for image in images], dim=0)       
+        #     image_features = self.encode_images(concat_images)
+        #     split_sizes = [image.shape[0] for image in images]
+        #     image_features = torch.split(image_features, split_sizes, dim=0)
+        #     image_features = [x.flatten(0, 1) for x in image_features]
+        # else:
+        #     # 处理单个图像批次
+        #     image_features = self.encode_images(images)
+
+        # [2025-11-18] 图像特征提取和分块
+        #   - eval 阶段：images 是 list[Tensor]，每个 Tensor 形状 (N_view, 3, H, W)
+        #   - 以后 train 阶段：也可以是 (B, N_view, 3, H, W) 的 5D Tensor
+        if isinstance(images, list) or (isinstance(images, torch.Tensor) and images.ndim == 5):
+            # 统一成 list[Tensor(N_view, 3, H, W)]
+            if isinstance(images, torch.Tensor):
+                image_list = [img for img in images]          # (B, N_view, 3, H, W) -> list 长度 B
+            else:
+                image_list = images                           # 本身就是 list
+
+            # 1）先把所有视图摊平成一个大 batch，送进视觉塔
+            #    sum_V = 所有 sample 的视图总数
+            concat_images = torch.cat(image_list, dim=0)      # (sum_V, 3, H, W)
+            all_feats = self.encode_images(concat_images)     # (sum_V, N_patch, D)
+
+            # 2）按每个样本的视图数切回来，并在视图维度上做平均 -> study-level 表征
+            split_sizes = [img.shape[0] for img in image_list]
+            per_sample = torch.split(all_feats, split_sizes, dim=0)   # tuple of (V_i, N_patch, D)
+
+            # 每个样本得到一个 (N_patch, D)，即融合好的多视角特征
+            image_features = [x.mean(dim=0) for x in per_sample]      # list[Tensor(N_patch, D)]
         else:
-            # 处理单个图像批次
+            # 单视图路径：images 为 (B, 3, H, W)
+            # encode_images 返回 (B, N_patch, D)，第 0 维就是 batch 维
             image_features = self.encode_images(images)
 
         # 准备存储新的输入嵌入和标签

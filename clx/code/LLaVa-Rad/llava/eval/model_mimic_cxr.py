@@ -99,11 +99,56 @@ def eval_model(
     os.makedirs(os.path.dirname(prediction_file), exist_ok=True)
     pred_file = open(prediction_file, "w")
     log_prediction = True
+    # 原本是每个样本一张图，现在要进行修改
+    # batches = create_batches(queries, batch_size, group_by_length, tokenizer)
+    # for batch_queries in tqdm(batches):
+    #     batch_prompts = []
+    #     batch_input_ids = []
+    #     batch_images = []
+    #     for query in batch_queries:
+    #         q = query["conversations"][0]["value"]
+
+    #         q = q.replace("<image>", "").strip()
+    #         if model.config.mm_use_im_start_end:
+    #             q = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + q
+    #         else:
+    #             q = DEFAULT_IMAGE_TOKEN + '\n' + q
+
+    #         conv= conv_templates[conv_mode].copy()
+    #         conv.append_message(conv.roles[0], q)
+    #         conv.append_message(conv.roles[1], None)
+    #         prompt = conv.get_prompt()
+
+    #         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+
+    #         image = Image.open(os.path.join(image_folder, query["image"])).convert("RGB")
+    #         image_tensor = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+
+    #         batch_prompts.append(prompt)
+    #         batch_input_ids.append(input_ids)
+    #         batch_images.append(image_tensor)
+
+    #     stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+        
+
+    #     with torch.inference_mode():
+    #         batch_output_ids = model.generate(
+    #             torch.stack(batch_input_ids).cuda(),
+    #             images=torch.stack(batch_images).half().cuda(),
+    #             do_sample=True if temperature > 0 else False,
+    #             temperature=temperature,
+    #             top_p=top_p,
+    #             num_beams=num_beams,
+    #             max_new_tokens=256,
+    #             use_cache=True).cpu()
+    
+    # [2025-11-18] 读图 + 组 batch + generate
     batches = create_batches(queries, batch_size, group_by_length, tokenizer)
     for batch_queries in tqdm(batches):
         batch_prompts = []
         batch_input_ids = []
-        batch_images = []
+        batch_images = []   # 每个元素是一个 study 的多视角张量 (N_view, 3, H, W)
+
         for query in batch_queries:
             q = query["conversations"][0]["value"]
 
@@ -113,33 +158,59 @@ def eval_model(
             else:
                 q = DEFAULT_IMAGE_TOKEN + '\n' + q
 
-            conv= conv_templates[conv_mode].copy()
+            conv = conv_templates[conv_mode].copy()
             conv.append_message(conv.roles[0], q)
             conv.append_message(conv.roles[1], None)
             prompt = conv.get_prompt()
 
-            input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+            input_ids = tokenizer_image_token(
+                prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+            )
 
-            image = Image.open(os.path.join(image_folder, query["image"])).convert("RGB")
-            image_tensor = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            # ====== 新的多视角读图逻辑 ======
+            img_field = query["image"]   # 现在 loader 已经保证是 str 或 list[str]
+
+            if isinstance(img_field, list):
+                pil_images = []
+                for rel_path in img_field:
+                    img_path = os.path.join(image_folder, rel_path)
+                    pil_images.append(Image.open(img_path).convert("RGB"))
+
+                view_tensors = []
+                for img in pil_images:
+                    view_tensors.append(
+                        image_processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
+                    )
+                # (N_view, 3, H, W)
+                image_tensor = torch.stack(view_tensors, dim=0)
+            else:
+                # 单视角样本：补一个视图维度，变成 (1, 3, H, W)
+                img_path = os.path.join(image_folder, img_field)
+                img = Image.open(img_path).convert("RGB")
+                single = image_processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
+                image_tensor = single.unsqueeze(0)
 
             batch_prompts.append(prompt)
             batch_input_ids.append(input_ids)
             batch_images.append(image_tensor)
 
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-        
 
         with torch.inference_mode():
+            input_ids_tensor = torch.stack(batch_input_ids).to(device)
+
+            # ★ 注意：这里直接把 list[Tensor(N_view,3,H,W)] 传进去，
+            # 在 prepare_inputs_labels_for_multimodal 里会统一做 cat -> encode -> mean pooling
             batch_output_ids = model.generate(
-                torch.stack(batch_input_ids).cuda(),
-                images=torch.stack(batch_images).half().cuda(),
+                input_ids_tensor,
+                images=batch_images,
                 do_sample=True if temperature > 0 else False,
                 temperature=temperature,
                 top_p=top_p,
                 num_beams=num_beams,
                 max_new_tokens=256,
-                use_cache=True).cpu()
+                use_cache=True,
+            ).cpu()
 
             batch_outputs = tokenizer.batch_decode(
                 batch_output_ids[:, len(batch_input_ids[0]):], skip_special_tokens=True
