@@ -23,7 +23,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, \
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
+from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM, SimpleViewAttention
 
 
 class LlavaConfig(LlamaConfig):                 # 继承LLaMA配置，定义LLaVA模型类型
@@ -35,7 +35,8 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):                  # 组合视�
 
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
-
+        # [2025-11-19] 这里的 dim 要和 encode_images 输出的 D 一致，等于 LLM 的 hidden_size
+        self.view_attn = SimpleViewAttention(dim=config.hidden_size)
 
 # 语言生成模型，负责端到端的训练和推理。继承自 LlamaForCausalLM（纯文本生成模型）和 LlavaMetaForCausalLM（多模态支持）
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):

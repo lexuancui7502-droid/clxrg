@@ -12,6 +12,8 @@ from PIL import Image, ImageFile
 # https://stackoverflow.com/questions/12984426/pil-ioerror-image-file-truncated-with-big-images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+from open_clip import create_model_and_transforms
+from transformers import CLIPImageProcessor
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.utils import build_logger, disable_torch_init, data_loaders
 from llava.model.builder import load_pretrained_model
@@ -82,12 +84,91 @@ def eval_model(
     disable_torch_init()
     model_path = os.path.expanduser(model_path)
     model_name = get_model_name_from_path(model_path)
-    if not model_name.startswith("llavarad"):
+    # [2025-11-26] 注释掉了两行代码，不再限制模块的权重名称。强制把 model_name 改成带 "llava" 的形式，让 builder 走多模态分支
+    # if not model_name.startswith("llavarad"):
         # "llava" needs to be in model_name to correctly load the model.
-        raise ValueError(f"Model name {model_name} is not 'llavarad'.")
+        # raise ValueError(f"Model name {model_name} is not 'llavarad'.")
+    if "biomedclip_cxr_518" in model_name and "llava" not in model_name.lower():
+        model_name = "llavarad-" + model_name
     logger.info(f"Loading the model {model_name} ...")
     tokenizer, model, image_processor, context_len = load_pretrained_model(
         model_path, model_base, model_name, load_8bit, load_4bit, device=device)
+    
+    # [2025-11-26] 补 config 字段，防止 AttributeError
+    if not hasattr(model.config, "mm_use_im_start_end"):
+        model.config.mm_use_im_start_end = False
+    if not hasattr(model.config, "mm_use_im_patch_token"):
+        model.config.mm_use_im_patch_token = False
+
+    from open_clip import create_model_and_transforms, get_pretrained_cfg
+
+    if image_processor is None:
+        logger.warning("image_processor is None, manually loading OpenCLIP BiomedCLIP_CXR_518 processor.")
+        try:
+            # 1) 用和训练阶段一样的环境变量，如果没设置就退回到绝对路径
+            vision_cfg = os.environ.get(
+                "LLAVARAD_VISION_CFG",
+                "/media/cuilexuan/clx/weights/biomedclip/biomedclipcxr_518.json",
+            )
+            pretrained_path = os.environ.get(
+                "BIOMEDCLIP_CKPT",
+                "/media/cuilexuan/clx/weights/biomedclip/ckpt.pt",
+            )
+
+            logger.info(f"Loading BiomedCLIP vision config from {vision_cfg}")
+            if not os.path.exists(vision_cfg):
+                raise FileNotFoundError(f"Vision config not found: {vision_cfg}")
+
+            # 2) 从 JSON 里读出 open_clip 的真正模型名和图像尺寸
+            with open(vision_cfg, "r") as f:
+                model_cfg = json.load(f)
+
+            model_name = model_cfg.get("model_name", "ViT-B-16")
+            image_size = int(model_cfg.get("image_size", 518))
+
+            logger.info(
+                f"Creating OpenCLIP model_name={model_name}, "
+                f"pretrained={pretrained_path}, image_size={image_size}"
+            )
+
+            # 3) 只要 preprocess（图像预处理 pipeline）
+            _, _, preprocess = create_model_and_transforms(
+                model_name=model_name,
+                pretrained=None,
+            )
+
+            image_processor = preprocess
+            logger.info("✅ Successfully loaded BiomedCLIP_CXR_518 preprocess using local config/env vars.")
+        except Exception as e:
+            logger.error(f"❌ Failed to load BiomedCLIP_CXR_518 preprocess: {e}")
+            raise
+
+    # [2025-11-26] 新增工具函数
+    def _process_image(img, image_processor):
+        """
+        统一把 PIL.Image 转成 (3, H, W) 的 torch.Tensor.
+        兼容两种情况：
+        1) HuggingFace CLIPImageProcessor: 有 .preprocess(...)
+        2) open_clip 的 transforms.Compose: 本身是一个 callable
+        """
+        # 情况 1：HuggingFace 的 ImageProcessor
+        if hasattr(image_processor, "preprocess"):
+            return image_processor.preprocess(
+                img,
+                return_tensors="pt"
+            )["pixel_values"][0]  # (3, H, W)
+
+        # 情况 2：open_clip 的 transforms.Compose
+        if callable(image_processor):
+            import torch
+            tensor = image_processor(img)  # (3, H, W)
+            # 保证是 float tensor
+            if not torch.is_tensor(tensor):
+                raise TypeError(f"image_processor(img) should return a tensor, got {type(tensor)}")
+            return tensor
+
+        raise TypeError(f"Unsupported image_processor type: {type(image_processor)}")
+
 
     # load data
     all_queries = data_loaders[loader](query_file)
@@ -153,6 +234,10 @@ def eval_model(
             q = query["conversations"][0]["value"]
 
             q = q.replace("<image>", "").strip()
+
+            # [2025-11-26] 新增
+            use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
+
             if model.config.mm_use_im_start_end:
                 q = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + q
             else:
@@ -179,7 +264,8 @@ def eval_model(
                 view_tensors = []
                 for img in pil_images:
                     view_tensors.append(
-                        image_processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
+                        # image_processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
+                         _process_image(img, image_processor)
                     )
                 # (N_view, 3, H, W)
                 image_tensor = torch.stack(view_tensors, dim=0)
@@ -187,7 +273,8 @@ def eval_model(
                 # 单视角样本：补一个视图维度，变成 (1, 3, H, W)
                 img_path = os.path.join(image_folder, img_field)
                 img = Image.open(img_path).convert("RGB")
-                single = image_processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
+                # single = image_processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
+                single = _process_image(img, image_processor)
                 image_tensor = single.unsqueeze(0)
 
             batch_prompts.append(prompt)

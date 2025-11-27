@@ -24,6 +24,23 @@ from .multimodal_projector.builder import build_vision_projector
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
+# [2025-11-19] 定义一个简单的view-attention模块
+class SimpleViewAttention(nn.Module):
+    """
+    输入: feats (V, D)  —— 每个视图的全局特征
+    输出: weights (V, 1) —— 每个视图的标量权重 (未 softmax)
+    """
+    def __init__(self, dim, hidden_dim=256):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.act = nn.Tanh()
+        self.fc2 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, feats):   # feats: (V, D)
+        scores = self.fc2(self.act(self.fc1(feats)))  # (V, 1)
+        return scores
+
+
 # 这个类定义了多模态基础模型，结合视觉编码器和语言模型
 class LlavaMetaModel:
 
@@ -56,6 +73,11 @@ class LlavaMetaModel:
 
         # 构建视觉编码器
         vision_tower = build_vision_tower(model_args)
+
+        # [2025-11-19] 新增代码，确保全程冻结视觉塔
+        for p in vision_tower.parameters():
+            p.requires_grad_(False)
+        vision_tower.eval()
 
         # 兼容不同的分布式训练策略，确保模型在不同并行模式下正常工作
         if fsdp is not None and len(fsdp) > 0:
@@ -174,11 +196,48 @@ class LlavaMetaForCausalLM(ABC):
             per_sample = torch.split(all_feats, split_sizes, dim=0)   # tuple of (V_i, N_patch, D)
 
             # 每个样本得到一个 (N_patch, D)，即融合好的多视角特征
-            image_features = [x.mean(dim=0) for x in per_sample]      # list[Tensor(N_patch, D)]
-        else:
+        #     image_features = [x.mean(dim=0) for x in per_sample]      # list[Tensor(N_patch, D)]
+        # else:
             # 单视图路径：images 为 (B, 3, H, W)
             # encode_images 返回 (B, N_patch, D)，第 0 维就是 batch 维
-            image_features = self.encode_images(images)
+        #     image_features = self.encode_images(images)
+
+            # 3）对每个样本，进行黑盒 view-attention 融合
+            model = self.get_model()
+            view_attn = getattr(model, "view_attn", None)
+
+            fused_features = []
+            for x in per_sample:
+                # x: (V, N_patch, D_lm)
+                V, Np, D = x.shape
+
+                if view_attn is None:
+                    # 兜底：如果没挂 view_attn，就退回简单平均
+                    fused = x.mean(dim=0)            # (N_patch, D)
+                    fused_features.append(fused)
+                    continue
+
+                # (1) 先对 patch 维做平均，得到每个视图的全局特征 (V, D)
+                global_feats = x.mean(dim=1)         # (V, D)
+
+                # (2) 通过 MLP 得到每个视图的 score -> softmax 得到权重 β
+                scores = view_attn(global_feats)     # (V, 1)
+                weights = torch.softmax(scores, dim=0)  # (V, 1)
+
+                # (3) 把标量权重扩展到 patch 维度上，对视图加权求和
+                weights_ = weights.view(V, 1, 1)     # (V, 1, 1)
+                fused = (weights_ * x).sum(dim=0)    # (N_patch, D)
+
+                fused_features.append(fused)
+
+            # 最终每个样本是 (N_patch, D_lm)
+            image_features = fused_features
+        else:
+            # 单视图路径：images 为 (B, 3, H, W)
+            image_features = self.encode_images(images)  # (B, N_patch, D_lm)
+            # 为了跟上面统一成 list[Tensor(N_patch,D_lm)]：
+            if isinstance(image_features, torch.Tensor):
+                image_features = [feat for feat in image_features]
 
         # 准备存储新的输入嵌入和标签
         new_input_embeds = []
