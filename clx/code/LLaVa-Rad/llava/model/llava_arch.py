@@ -158,6 +158,10 @@ class LlavaMetaForCausalLM(ABC):
         self, input_ids, attention_mask, past_key_values, labels, images
     ):
         vision_tower = self.get_vision_tower()
+
+        # [2025-11-27] 每次调用先清空上一轮的缓存
+        self._last_study_image_global = None
+
         # 输入验证和处理
         if vision_tower is None or images is None or input_ids.shape[1] == 1:           # 如果没有视觉编码器或图像，或输入仅包含单个token，则不进行多模态处理
             if past_key_values is not None and vision_tower is not None and images is not None and input_ids.shape[1] == 1:         # 仅在特定条件下调整注意力掩码
@@ -203,34 +207,36 @@ class LlavaMetaForCausalLM(ABC):
         #     image_features = self.encode_images(images)
 
             # 3）对每个样本，进行黑盒 view-attention 融合
-            model = self.get_model()
-            view_attn = getattr(model, "view_attn", None)
+            # model = self.get_model()
+            # view_attn = getattr(model, "view_attn", None)
 
-            fused_features = []
-            for x in per_sample:
-                # x: (V, N_patch, D_lm)
-                V, Np, D = x.shape
+            # fused_features = []
+            # for x in per_sample:
+            #     # x: (V, N_patch, D_lm)
+            #     V, Np, D = x.shape
 
-                if view_attn is None:
-                    # 兜底：如果没挂 view_attn，就退回简单平均
-                    fused = x.mean(dim=0)            # (N_patch, D)
-                    fused_features.append(fused)
-                    continue
+            #     if view_attn is None:
+            #         # 兜底：如果没挂 view_attn，就退回简单平均
+            #         fused = x.mean(dim=0)            # (N_patch, D)
+            #         fused_features.append(fused)
+            #         continue
 
-                # (1) 先对 patch 维做平均，得到每个视图的全局特征 (V, D)
-                global_feats = x.mean(dim=1)         # (V, D)
+            #     # (1) 先对 patch 维做平均，得到每个视图的全局特征 (V, D)
+            #     global_feats = x.mean(dim=1)         # (V, D)
 
-                # (2) 通过 MLP 得到每个视图的 score -> softmax 得到权重 β
-                scores = view_attn(global_feats)     # (V, 1)
-                weights = torch.softmax(scores, dim=0)  # (V, 1)
+            #     # (2) 通过 MLP 得到每个视图的 score -> softmax 得到权重 β
+            #     scores = view_attn(global_feats)     # (V, 1)
+            #     weights = torch.softmax(scores, dim=0)  # (V, 1)
 
-                # (3) 把标量权重扩展到 patch 维度上，对视图加权求和
-                weights_ = weights.view(V, 1, 1)     # (V, 1, 1)
-                fused = (weights_ * x).sum(dim=0)    # (N_patch, D)
+            #     # (3) 把标量权重扩展到 patch 维度上，对视图加权求和
+            #     weights_ = weights.view(V, 1, 1)     # (V, 1, 1)
+            #     fused = (weights_ * x).sum(dim=0)    # (N_patch, D)
 
-                fused_features.append(fused)
+            #     fused_features.append(fused)
 
             # 最终每个样本是 (N_patch, D_lm)
+            # ✅ 暂时统一用简单平均做多视图融合（完全恢复你当初的 baseline）
+            fused_features = [x.mean(dim=0) for x in per_sample]      # list[Tensor(N_patch, D)]
             image_features = fused_features
         else:
             # 单视图路径：images 为 (B, 3, H, W)
@@ -238,6 +244,20 @@ class LlavaMetaForCausalLM(ABC):
             # 为了跟上面统一成 list[Tensor(N_patch,D_lm)]：
             if isinstance(image_features, torch.Tensor):
                 image_features = [feat for feat in image_features]
+
+
+        # [2025-11-27] 新增：为检查级对齐缓存每个 study 的全局视觉向量
+        # 此时 image_features 是长度为 B 的 list，每个元素形状 (N_patch, D_lm)
+        if len(image_features) > 0:
+            # 对 patch 维度做平均，得到 (B, D_lm) 的 study-level 表征
+            study_global = torch.stack(
+                [feat.mean(dim=0) for feat in image_features],
+                dim=0
+            )  # (B, D_lm)
+            # 直接挂在模型实例上，供 forward() 使用
+            self._last_study_image_global = study_global
+        else:
+            self._last_study_image_global = None
 
         # 准备存储新的输入嵌入和标签
         new_input_embeds = []

@@ -17,6 +17,8 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
+from llava.constants import IGNORE_INDEX
 
 from transformers import AutoConfig, AutoModelForCausalLM, \
                          LlamaConfig, LlamaModel, LlamaForCausalLM
@@ -51,7 +53,15 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)         # 语言模型头：将隐藏状态映射到词汇表大小的线性层
 
-        # Initialize weights and apply final processing
+        # [2025-11-27] 用于检查级对齐的一些超参数 & 缓存
+        # 对比损失的温度和权重，先给一个默认值，之后你可以写到 config 里去
+        self.study_contrast_tau = getattr(config, "study_contrast_tau", 0.07)
+        self.study_contrast_weight = getattr(config, "study_contrast_weight", 0.05)
+
+        # 每次 forward 里由 prepare_inputs_labels_for_multimodal 写入 (B, D) 的视觉表征
+        self._last_study_image_global = None
+
+        # Initialize weights...
         self.post_init()
 
     def get_model(self):
@@ -108,6 +118,51 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             # Enable model/pipeline parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+
+
+        # === [2025-11-27] 新增：检查级对齐（study-level image ↔ report text） ===
+        # 条件：有标签 + 有图像（prepare_inputs_labels_for_multimodal 已经写好了缓存）
+        if (
+            labels is not None
+            and getattr(self, "_last_study_image_global", None) is not None
+        ):
+            img_global = self._last_study_image_global.to(hidden_states.device)  # (B, D)
+            B, T, D = hidden_states.shape
+
+            # 1) 用 labels!=IGNORE_INDEX 作为“报告 token”掩码
+            #    —— 这些位置正好是需要预测的 findings/impression token
+            label_mask = labels != IGNORE_INDEX   # (B, T)
+            if attention_mask is not None:
+                # 再与 attention_mask 取交集，去掉 padding
+                label_mask = label_mask & attention_mask.bool()
+
+            # 2) 对每个样本，把对应 token 的 hidden_states 做 mean-pool，得到文本表征
+            text_pooled = []
+            for b in range(B):
+                h_b = hidden_states[b]   # (T, D)
+                m_b = label_mask[b]      # (T,)
+                if m_b.any():
+                    text_pooled.append(h_b[m_b].mean(dim=0))
+                else:
+                    # 保险起见，万一某个样本全是 IGNORE_INDEX，就退回全局平均
+                    text_pooled.append(h_b.mean(dim=0))
+            text_pooled = torch.stack(text_pooled, dim=0)   # (B, D)
+
+            # 3) CLIP 风格 InfoNCE 对比：image ↔ text
+            img_norm = F.normalize(img_global, dim=-1)      # (B, D)
+            txt_norm = F.normalize(text_pooled, dim=-1)     # (B, D)
+
+            logits_per_img = img_norm @ txt_norm.t() / self.study_contrast_tau  # (B, B)
+            targets = torch.arange(B, device=logits_per_img.device)
+
+            loss_i2t = F.cross_entropy(logits_per_img, targets)
+            loss_t2i = F.cross_entropy(logits_per_img.t(), targets)
+            contrast_loss = 0.5 * (loss_i2t + loss_t2i)
+
+            # 4) 加权叠加到总 loss 上
+            if loss is None:
+                loss = 0.0
+            loss = loss + self.study_contrast_weight * contrast_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
