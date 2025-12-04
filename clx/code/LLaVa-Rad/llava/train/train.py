@@ -893,8 +893,63 @@ def train():
     model.config.use_cache = False
 
     # 可选择冻结基础语言模型，只训练适配器
-    if model_args.freeze_backbone:
-        model.model.requires_grad_(False)
+    # if model_args.freeze_backbone:
+    #     model.model.requires_grad_(False)
+
+    # # [2025-11-29] 新增训练相关的代码
+    # core = model.get_model()   # LlavaLlamaModel
+
+    # # ✅ 单独解冻 view_attn（多视角融合模块）
+    # if hasattr(core, "view_attn"):
+    #     for p in core.view_attn.parameters():
+    #         p.requires_grad_(True)
+
+    # # ✅ 不想破坏原本的解码头，就把 lm_head 也冻结
+    # for p in model.lm_head.parameters():
+    #     p.requires_grad_(False)
+
+    # ===== [2025-11-29] 冻结 / 解冻策略 =====
+    core = model.get_model()  # LlavaLlamaModel（多模态骨干）
+
+    # 1. 冻结整个 backbone
+    core.requires_grad_(False)
+    
+    # 2. 冻结 lm_head（输出层）
+    for p in model.lm_head.parameters():
+        p.requires_grad_(False)
+    
+    train_modules = []
+    
+    # 3. 允许训练 view_attn
+    if hasattr(core, "view_attn"):
+        for p in core.view_attn.parameters():
+            p.requires_grad_(True)
+        train_modules.append("view_attn")
+    
+    # 4. 解冻 mm_projector
+    if hasattr(core, "mm_projector"):
+        for p in core.mm_projector.parameters():
+            p.requires_grad_(True)
+        train_modules.append("mm_projector")
+    
+    print(f"[INFO] Training modules: {train_modules}")
+
+    # 4) 调试打印：看看到底在训谁
+    def rank0_print(*args, **kwargs):
+        # 单卡训练，直接 print；如果将来多卡，可以根据 local_rank 做判断
+        print(*args, **kwargs)
+
+    trainable = [(n, p.numel()) for n, p in model.named_parameters() if p.requires_grad]
+    n_trainable = sum(n for _, n in trainable)
+    n_total = sum(p.numel() for p in model.parameters())
+
+    rank0_print(f"Trainable modules: {train_modules}")
+    rank0_print(f"Trainable params: {n_trainable} / {n_total} "
+                f"({n_trainable / n_total:.4f} of total)")
+    for name, n in trainable:
+        if any(k in name for k in train_modules):
+            rank0_print(f"  - {name}: {n/1e6:.2f}M params")
+
 
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training

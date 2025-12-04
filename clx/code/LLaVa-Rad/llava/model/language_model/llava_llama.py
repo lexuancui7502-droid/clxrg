@@ -56,7 +56,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         # [2025-11-27] 用于检查级对齐的一些超参数 & 缓存
         # 对比损失的温度和权重，先给一个默认值，之后你可以写到 config 里去
         self.study_contrast_tau = getattr(config, "study_contrast_tau", 0.07)
-        self.study_contrast_weight = getattr(config, "study_contrast_weight", 0.05)
+        # [2025-12-2] 修改，训练“轻量版 view_attn”阶段默认不启用对比损失 => 默认 0.0
+        self.study_contrast_weight = getattr(config, "study_contrast_weight", 0.0)
 
         # 每次 forward 里由 prepare_inputs_labels_for_multimodal 写入 (B, D) 的视觉表征
         self._last_study_image_global = None
@@ -120,20 +121,19 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             loss = loss_fct(shift_logits, shift_labels)
 
 
-        # === [2025-11-27] 新增：检查级对齐（study-level image ↔ report text） ===
-        # 条件：有标签 + 有图像（prepare_inputs_labels_for_multimodal 已经写好了缓存）
+        # === [2025-12-2] 修改：检查级对齐（study-level image ↔ report text） ===
+        # 条件：有标签 + 有图像 + study_contrast_weight>0 才启用对比损失，目前是关闭的
         if (
             labels is not None
             and getattr(self, "_last_study_image_global", None) is not None
+            and getattr(self, "study_contrast_weight", 0.0) > 0
         ):
             img_global = self._last_study_image_global.to(hidden_states.device)  # (B, D)
             B, T, D = hidden_states.shape
 
             # 1) 用 labels!=IGNORE_INDEX 作为“报告 token”掩码
-            #    —— 这些位置正好是需要预测的 findings/impression token
             label_mask = labels != IGNORE_INDEX   # (B, T)
             if attention_mask is not None:
-                # 再与 attention_mask 取交集，去掉 padding
                 label_mask = label_mask & attention_mask.bool()
 
             # 2) 对每个样本，把对应 token 的 hidden_states 做 mean-pool，得到文本表征
@@ -144,7 +144,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 if m_b.any():
                     text_pooled.append(h_b[m_b].mean(dim=0))
                 else:
-                    # 保险起见，万一某个样本全是 IGNORE_INDEX，就退回全局平均
                     text_pooled.append(h_b.mean(dim=0))
             text_pooled = torch.stack(text_pooled, dim=0)   # (B, D)
 
@@ -159,7 +158,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             loss_t2i = F.cross_entropy(logits_per_img.t(), targets)
             contrast_loss = 0.5 * (loss_i2t + loss_t2i)
 
-            # 4) 加权叠加到总 loss 上
             if loss is None:
                 loss = 0.0
             loss = loss + self.study_contrast_weight * contrast_loss

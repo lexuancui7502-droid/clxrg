@@ -15,6 +15,7 @@
 
 from abc import ABC, abstractmethod
 
+import os
 import torch
 import torch.nn as nn
 
@@ -26,18 +27,25 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 
 # [2025-11-19] 定义一个简单的view-attention模块
 class SimpleViewAttention(nn.Module):
-    """
-    输入: feats (V, D)  —— 每个视图的全局特征
-    输出: weights (V, 1) —— 每个视图的标量权重 (未 softmax)
-    """
     def __init__(self, dim, hidden_dim=256):
         super().__init__()
         self.fc1 = nn.Linear(dim, hidden_dim)
         self.act = nn.Tanh()
         self.fc2 = nn.Linear(hidden_dim, 1)
 
-    def forward(self, feats):   # feats: (V, D)
-        scores = self.fc2(self.act(self.fc1(feats)))  # (V, 1)
+        # === [2025-11-30] 因为随机初始化会导致视觉特征投影到一个新的特征空间，所以进行关键初始化：让一开始 scores 全是 0 ===
+        # softmax(0,...,0) = 1/V，相当于等权平均
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, feats):
+        """
+        feats: (V, D) 视图级的 global feature
+        return: (V, 1) 每个视角的打分
+        """
+        x = self.fc1(feats)     # (V, hidden_dim)
+        x = self.act(x)
+        scores = self.fc2(x)    # (V, 1)
         return scores
 
 
@@ -207,36 +215,41 @@ class LlavaMetaForCausalLM(ABC):
         #     image_features = self.encode_images(images)
 
             # 3）对每个样本，进行黑盒 view-attention 融合
-            # model = self.get_model()
-            # view_attn = getattr(model, "view_attn", None)
+            model = self.get_model()
+            view_attn = getattr(model, "view_attn", None)
 
-            # fused_features = []
-            # for x in per_sample:
-            #     # x: (V, N_patch, D_lm)
-            #     V, Np, D = x.shape
+            # [2025-11-30] 修改加权融合方法，用“残差插值”的方式融合：baseline + 小偏移
+            fused_features = []
+            for x in per_sample:
+                # x: (V, N_patch, D_lm)
+                V, Np, D = x.shape
 
-            #     if view_attn is None:
-            #         # 兜底：如果没挂 view_attn，就退回简单平均
-            #         fused = x.mean(dim=0)            # (N_patch, D)
-            #         fused_features.append(fused)
-            #         continue
+                # ① baseline：简单平均（完全在原有空间里）
+                baseline = x.mean(dim=0)   # (N_patch, D)
 
-            #     # (1) 先对 patch 维做平均，得到每个视图的全局特征 (V, D)
-            #     global_feats = x.mean(dim=1)         # (V, D)
+                if view_attn is None:
+                    fused = baseline
+                    fused_features.append(fused)
+                    continue
 
-            #     # (2) 通过 MLP 得到每个视图的 score -> softmax 得到权重 β
-            #     scores = view_attn(global_feats)     # (V, 1)
-            #     weights = torch.softmax(scores, dim=0)  # (V, 1)
+                # ② view-attn 产生一组权重 β_v，得到“注意力融合”的结果
+                global_feats = x.mean(dim=1)         # (V, D)
+                scores = view_attn(global_feats)     # (V, 1)
+                weights = torch.softmax(scores, dim=0)
+                weights_ = weights.view(V, 1, 1)
+                attn_fused = (weights_ * x).sum(dim=0)    # (N_patch, D)
 
-            #     # (3) 把标量权重扩展到 patch 维度上，对视图加权求和
-            #     weights_ = weights.view(V, 1, 1)     # (V, 1, 1)
-            #     fused = (weights_ * x).sum(dim=0)    # (N_patch, D)
+                # ③ 残差插值：从 baseline 出发，只走一小步到 attn_fused
+                #    lambda 可以先手动设小一点，例如 0.3
+                lambda_ = float(os.environ.get("MV_LAMBDA", "0.05"))
 
-            #     fused_features.append(fused)
+                fused = (1.0 - lambda_) * baseline + lambda_ * attn_fused
+
+                fused_features.append(fused)
 
             # 最终每个样本是 (N_patch, D_lm)
-            # ✅ 暂时统一用简单平均做多视图融合（完全恢复你当初的 baseline）
-            fused_features = [x.mean(dim=0) for x in per_sample]      # list[Tensor(N_patch, D)]
+            # ✅ [2025-11-29] 暂时统一用简单平均做多视图融合（完全恢复你当初的 baseline）
+            # fused_features = [x.mean(dim=0) for x in per_sample]      # list[Tensor(N_patch, D)]
             image_features = fused_features
         else:
             # 单视图路径：images 为 (B, 3, H, W)
