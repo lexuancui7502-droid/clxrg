@@ -13,7 +13,7 @@
 #    limitations under the License.
 
 from typing import List, Optional, Tuple, Union
-
+import os
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
@@ -25,7 +25,14 @@ from transformers import AutoConfig, AutoModelForCausalLM, \
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM, SimpleViewAttention
+# [2025-12-7] 修改
+# from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM, SimpleViewAttention
+from ..llava_arch import (
+    LlavaMetaModel,
+    LlavaMetaForCausalLM,
+    SimpleViewAttention,
+    MultiSlotFusion,     # <<< 新增
+)
 
 
 class LlavaConfig(LlamaConfig):                 # 继承LLaMA配置，定义LLaVA模型类型
@@ -35,10 +42,37 @@ class LlavaConfig(LlamaConfig):                 # 继承LLaMA配置，定义LLaV
 class LlavaLlamaModel(LlavaMetaModel, LlamaModel):                  # 组合视觉和语言能力，继承自LLaMA模型。LlamaModel: 提供文本理解能力；LlavaMetaModel: 提供多模态融合能力
     config_class = LlavaConfig
 
+    # [2025-12-8] 修改 开始：修改整个init函数
+    # def __init__(self, config: LlamaConfig):
+    #     super(LlavaLlamaModel, self).__init__(config)
+    #     # [2025-11-19] 这里的 dim 要和 encode_images 输出的 D 一致，等于 LLM 的 hidden_size
+    #     self.view_attn = SimpleViewAttention(dim=config.hidden_size)
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
-        # [2025-11-19] 这里的 dim 要和 encode_images 输出的 D 一致，等于 LLM 的 hidden_size
-        self.view_attn = SimpleViewAttention(dim=config.hidden_size)
+
+        # 这里的 dim 要和 encode_images 输出的 D 一致，等于 LLM 的 hidden_size
+        dim = config.hidden_size
+
+        # 视图级加权模块（保留，以后你想关掉也可以）
+        self.view_attn = SimpleViewAttention(dim=dim)
+
+        # 多-slot study-level 融合模块
+        num_slots = getattr(config, "num_slots", 4)
+        attn_dim = getattr(config, "slot_attn_dim", None)
+        ffn_hidden_dim = getattr(config, "slot_ffn_hidden_dim", None)
+        num_view_types = getattr(config, "num_view_types", 4)
+        num_orient_types = getattr(config, "num_orient_types", 3)
+
+        self.slot_fusion = MultiSlotFusion(
+            dim=dim,
+            num_slots=num_slots,
+            attn_dim=attn_dim,
+            ffn_hidden_dim=ffn_hidden_dim,
+            num_view_types=num_view_types,
+            num_orient_types=num_orient_types,
+        )
+
+    # [2025-12-8] 修改 结束
 
 # 语言生成模型，负责端到端的训练和推理。继承自 LlamaForCausalLM（纯文本生成模型）和 LlavaMetaForCausalLM（多模态支持）
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
@@ -59,8 +93,13 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         # [2025-12-2] 修改，训练“轻量版 view_attn”阶段默认不启用对比损失 => 默认 0.0
         self.study_contrast_weight = getattr(config, "study_contrast_weight", 0.0)
 
-        # 每次 forward 里由 prepare_inputs_labels_for_multimodal 写入 (B, D) 的视觉表征
+        #[2025-12-8] 每次 forward 里由 prepare_inputs_labels_for_multimodal 写入 (B, D) 的视觉表征
         self._last_study_image_global = None
+        # 多-slot 正则项缓存（diversity / view-coverage）
+        self._last_slot_div_loss = None
+        self._last_slot_cov_loss = None
+
+        # [2025-12-7] 新增
 
         # Initialize weights...
         self.post_init()
@@ -68,7 +107,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
 
-    def forward(                # 定义前向传播逻辑，处理多模态输入（文本 + 图像）并计算损失或生成预测。
+    def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -79,6 +118,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
+        view_ids: Optional[List[torch.LongTensor]] = None,
+        orient_ids: Optional[List[torch.LongTensor]] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:                  # 定义模型的前向传播逻辑，处理多模态输入（文本 + 图像）并生成预测结果
         # 参数默认值处理​，如果参数未显式传入，则使用模型配置中的默认值。
@@ -88,9 +129,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict                           # 设置是否返回字典形式的输出
 
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(  # 将文本和图像输入融合为模型可处理的格式
-            input_ids, attention_mask, past_key_values, labels, images
-        )
+        input_ids, attention_mask, past_key_values, inputs_embeds, labels = \
+            self.prepare_inputs_labels_for_multimodal(
+                input_ids,
+                attention_mask,
+                past_key_values,
+                labels,
+                images,
+                view_ids=view_ids,
+                orient_ids=orient_ids,
+            )
+
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)     调用模型主体计算隐藏状态、注意力权重等
         outputs = self.model(
@@ -162,6 +211,22 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 loss = 0.0
             loss = loss + self.study_contrast_weight * contrast_loss
 
+        # === slot 正则：多样性 + 视图覆盖 ===
+        if getattr(self, "_last_slot_div_loss", None) is not None:
+            slot_div_lambda = float(os.environ.get("SLOT_DIV_LAMBDA", "0.0"))
+            if slot_div_lambda > 0:
+                if loss is None:
+                    loss = 0.0
+                loss = loss + slot_div_lambda * self._last_slot_div_loss
+
+        if getattr(self, "_last_slot_cov_loss", None) is not None:
+            view_cov_lambda = float(os.environ.get("VIEW_COV_LAMBDA", "0.0"))
+            if view_cov_lambda > 0:
+                if loss is None:
+                    loss = 0.0
+                loss = loss + view_cov_lambda * self._last_slot_cov_loss
+
+
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -186,14 +251,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         else:
             model_inputs = {"input_ids": input_ids}
 
-        model_inputs.update(                # 更新输入字典，包括KV缓存、图像数据和其他生成参数
+        model_inputs.update(
             {
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "images": kwargs.get("images", None),
+                "view_ids": kwargs.get("view_ids", None),
+                "orient_ids": kwargs.get("orient_ids", None),
             }
         )
+
         return model_inputs
 
 

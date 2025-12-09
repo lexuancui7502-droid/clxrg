@@ -29,7 +29,7 @@ import pathlib
 from typing import Dict, Optional, Sequence, List
 
 import torch
-
+import math
 import transformers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
@@ -44,6 +44,21 @@ from llava.utils import data_loaders
 from PIL import Image, ImageFile
 # https://stackoverflow.com/questions/12984426/pil-ioerror-image-file-truncated-with-big-images
 ImageFile.LOAD_TRUNCATED_IMAGES = True      # 防止因为几张损坏的图像而导致整个程序崩溃
+
+# ====== [2025-12-8] 多视角 metadata 词表（用于 embedding 编码） ======
+VIEW_VOCAB = {
+    "PA": 0,
+    "AP": 1,
+    "LATERAL": 2,      # 包括 LAT, LL, RL 等都可以归到这里
+    "OTHER": 3,
+}
+ORIENT_VOCAB = {
+    "Erect": 0,
+    "Supine": 1,
+    "Other": 2,
+}
+VIEW_PAD_ID = len(VIEW_VOCAB)      # 4
+ORIENT_PAD_ID = len(ORIENT_VOCAB)  # 3
 
 
 local_rank = None
@@ -776,15 +791,87 @@ class LazySupervisedDataset(Dataset):
                 labels=data_dict["labels"][0],
             )
 
-        # ---------- ③ 把 image 塞进 data_dict ----------
-        if 'image' in self.list_data_dict[i]:
-            data_dict['image'] = image          # (N_view, 3, H, W)
+        # ---------- [2025-12-8] ③ 把 image / 视角信息 塞进 data_dict ----------
+        sample = self.list_data_dict[i]
+
+        def _to_str_list(x):
+            """
+            把 json 里的 view / orientation 字段，安全地转成 list[str]。
+            可能的输入情况：
+              - None
+              - "PA" / "AP"
+              - ["PA", "LATERAL"]
+              - float / NaN / 其他乱七八糟
+            """
+            if x is None:
+                return []
+
+            # 已经是 list / tuple：逐个转成 str，过滤掉 None / NaN
+            if isinstance(x, (list, tuple)):
+                out = []
+                for v in x:
+                    if v is None:
+                        continue
+                    if isinstance(v, float) and math.isnan(v):
+                        continue
+                    out.append(str(v))
+                return out
+
+            # 单个字符串：直接包装成 list
+            if isinstance(x, str):
+                return [x]
+
+            # 单个 float/int：如果是 NaN 就当缺失，否则转成 str
+            if isinstance(x, (int, float)):
+                if isinstance(x, float) and math.isnan(x):
+                    return []
+                return [str(x)]
+
+            # 其他类型：直接当没有
+            return []
+
+        if 'image' in sample:
+            # 图像张量 (N_view, 3, H, W)
+            data_dict['image'] = image
+
+            # ===== 构造 view_ids / orient_ids =====
+            raw_views = sample.get("view", None)
+            raw_orients = sample.get("orientation", None)
+
+            raw_views_list = _to_str_list(raw_views)
+            raw_orients_list = _to_str_list(raw_orients)
+
+            n_views = image.shape[0]
+
+            # 如果 json 基本没给，就全填默认类型
+            if len(raw_views_list) == 0:
+                raw_views_list = ["OTHER"] * n_views
+            if len(raw_orients_list) == 0:
+                raw_orients_list = ["Other"] * n_views
+
+            # 长度不够就用最后一个补齐，太长就截断
+            if len(raw_views_list) < n_views:
+                raw_views_list = raw_views_list + [raw_views_list[-1]] * (n_views - len(raw_views_list))
+            if len(raw_orients_list) < n_views:
+                raw_orients_list = raw_orients_list + [raw_orients_list[-1]] * (n_views - len(raw_orients_list))
+
+            raw_views_list   = raw_views_list[:n_views]
+            raw_orients_list = raw_orients_list[:n_views]
+
+            # 映射到 ID（未知值 fallback 到 OTHER/Other）
+            view_ids = [VIEW_VOCAB.get(v, VIEW_VOCAB["OTHER"]) for v in raw_views_list]
+            orient_ids = [ORIENT_VOCAB.get(o, ORIENT_VOCAB["Other"]) for o in raw_orients_list]
+
+            data_dict["view_ids"] = torch.tensor(view_ids, dtype=torch.long)
+            data_dict["orient_ids"] = torch.tensor(orient_ids, dtype=torch.long)
+
         elif self.data_args.is_multimodal:
             # image 不存在但模型是多模态 → 填一个 dummy
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(
                 3, crop_size['height'], crop_size['width']
             )
+
         return data_dict
 
 
@@ -820,6 +907,12 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
+            # ====== [2025-12=8] 新增：把 view_ids / orient_ids 一起打包传给 model ======
+            if "view_ids" in instances[0]:
+                batch["view_ids"] = [ins["view_ids"] for ins in instances]
+            if "orient_ids" in instances[0]:
+                batch["orient_ids"] = [ins["orient_ids"] for ins in instances]
+
 
         return batch
 
@@ -918,21 +1011,57 @@ def train():
     for p in model.lm_head.parameters():
         p.requires_grad_(False)
     
+    # 3. 重新打开你要训练的“新模块”
     train_modules = []
     
-    # 3. 允许训练 view_attn
+    # [2025-12-7] 修改 开始
+    # # 3. 允许训练 view_attn
+    # if hasattr(core, "view_attn"):
+    #     for p in core.view_attn.parameters():
+    #         p.requires_grad_(True)
+    #     train_modules.append("view_attn")
+    
+    # # 4. 解冻 mm_projector
+    # if hasattr(core, "mm_projector"):
+    #     for p in core.mm_projector.parameters():
+    #         p.requires_grad_(True)
+    #     train_modules.append("mm_projector")
+    
+    # print(f"[INFO] Training modules: {train_modules}")
+    # 3.1 多-slot study-level 融合模块
+    if hasattr(core, "slot_fusion"):
+        for p in core.slot_fusion.parameters():
+            p.requires_grad_(True)
+        train_modules.append("slot_fusion")
+
+    # 3.2 view-level 融合模块（如果你还打算让它参与训练）
     if hasattr(core, "view_attn"):
         for p in core.view_attn.parameters():
             p.requires_grad_(True)
         train_modules.append("view_attn")
-    
-    # 4. 解冻 mm_projector
+
+    # 3.3 mm_projector：新的视觉 token 分布需要重新对齐到文本空间
     if hasattr(core, "mm_projector"):
         for p in core.mm_projector.parameters():
             p.requires_grad_(True)
         train_modules.append("mm_projector")
-    
-    print(f"[INFO] Training modules: {train_modules}")
+
+    # 3.4 如果你挂了检查级 / 疾病级对齐头，也一起解冻（没有的话不会进这个分支）
+    if hasattr(core, "study_align_head"):
+        for p in core.study_align_head.parameters():
+            p.requires_grad_(True)
+        train_modules.append("study_align_head")
+
+    if hasattr(core, "disease_head"):
+        for p in core.disease_head.parameters():
+            p.requires_grad_(True)
+        train_modules.append("disease_head")
+
+    if hasattr(core, "text_disease_head"):
+        for p in core.text_disease_head.parameters():
+            p.requires_grad_(True)
+        train_modules.append("text_disease_head")
+    # [2025-12-7] 修改 结束
 
     # 4) 调试打印：看看到底在训谁
     def rank0_print(*args, **kwargs):

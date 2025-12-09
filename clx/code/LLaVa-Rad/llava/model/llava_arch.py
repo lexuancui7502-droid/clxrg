@@ -15,6 +15,9 @@
 
 from abc import ABC, abstractmethod
 
+# [2025-12-7]新增
+import math
+# [2025-12-7]新增
 import os
 import torch
 import torch.nn as nn
@@ -47,6 +50,176 @@ class SimpleViewAttention(nn.Module):
         x = self.act(x)
         scores = self.fc2(x)    # (V, 1)
         return scores
+    
+# [2025-12-7] 新增Multi-slot 模块（公式里的 3~6 步：初始化槽 → Q/K/V → A=softmax → Z1=AV → FFN 残差）
+class MultiSlotFusion(nn.Module):
+    """
+    将同一 study 下所有视图的 patch token 展平，用 M 个 latent 槽位做一次 cross-attention 聚合。
+
+    输入:
+        x: Tensor, shape (N_total, D)        # 这里我们实际用的是 [V, L, D] 或 [1, V, L, D]
+    输出:
+        slots: Tensor, shape (M, D)          # M 个 study-level 视觉 token
+        attn:  Tensor, shape (M, N_total)    # 每个 slot 对所有 patch 的注意力权重
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_slots: int = 4,
+        attn_dim: int = None,
+        ffn_hidden_dim: int = None,
+        num_view_types: int = 4,
+        num_orient_types: int = 3,
+    ):
+        """
+        dim:       视觉特征维度（mm_projector 输出 = LLM hidden_size）
+        num_slots: 槽位个数 M
+        attn_dim:  槽位内部注意力空间维度（默认 = dim//2，省显存）
+        ffn_hidden_dim: FFN 隐藏层维度（默认 = 2*dim，省显存）
+        """
+        super().__init__()
+        self.dim = dim
+        self.num_slots = num_slots
+
+        # d_attn = attn_dim or (dim // 2)      # 例如 4096 -> 2048
+        # d_ffn = ffn_hidden_dim or (2 * dim)  # 例如 4096 -> 8192
+
+        d_attn = attn_dim or (dim // 4)      # 4096 -> 1024
+        d_ffn = ffn_hidden_dim or dim 
+
+        # 视角 / 体位 embedding（和视觉特征同维）
+        self.view_embed = nn.Embedding(num_view_types, dim)
+        self.orient_embed = nn.Embedding(num_orient_types, dim)
+
+        # M 个可学习的 slot 向量，在注意力空间 d_attn 里
+        self.slot_embed = nn.Parameter(torch.randn(num_slots, d_attn))
+
+        # Q/K/V 线性层（cross-attention）
+        self.q_proj = nn.Linear(d_attn, d_attn, bias=False)
+        self.k_proj = nn.Linear(dim, d_attn, bias=False)
+        self.v_proj = nn.Linear(dim, d_attn, bias=False)
+        self.o_proj = nn.Linear(d_attn, dim, bias=False)
+
+        # 轻量 FFN + 残差（回到 dim 空间）
+        self.norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, d_ffn),
+            nn.GELU(),
+            nn.Linear(d_ffn, dim),
+        )
+
+        # 存最近一次 forward 的正则项（注意：名字一定要和 llava_arch 里访问的一致）
+        self.last_div_loss = None   # slot diversity loss
+        self.last_cov_loss = None   # view coverage loss
+
+    def forward(self, x, view_ids=None, orient_ids=None):
+        """
+        x: Tensor, shape [V, L, D] 或 [1, V, L, D]
+        view_ids / orient_ids: [V]
+        """
+        # 支持 batch_size=1 的 [1, V, L, D]
+        if x.dim() == 4:
+            # 假设当前阶段 batch_size=1
+            x = x[0]
+        if x.dim() != 3:
+            raise ValueError(f"MultiSlotFusion expects [V,L,D] or [1,V,L,D], got {x.shape}")
+
+        V, L, D = x.shape
+        device = x.device
+
+        # ------ 1) 加视角 / 体位 embedding ------
+        if view_ids is not None:
+            view_ids = view_ids.to(device)
+            if view_ids.ndim == 0:
+                view_ids = view_ids.unsqueeze(0)
+            if view_ids.numel() < V:
+                view_ids = torch.cat(
+                    [view_ids,
+                     view_ids.new_full((V - view_ids.numel(),), view_ids[-1].item())],
+                    dim=0,
+                )
+            view_ids = view_ids[:V]
+            ve = self.view_embed(view_ids).unsqueeze(1)  # [V,1,D]
+            x = x + ve
+
+        if orient_ids is not None:
+            orient_ids = orient_ids.to(device)
+            if orient_ids.ndim == 0:
+                orient_ids = orient_ids.unsqueeze(0)
+            if orient_ids.numel() < V:
+                orient_ids = torch.cat(
+                    [orient_ids,
+                     orient_ids.new_full((V - orient_ids.numel(),), orient_ids[-1].item())],
+                    dim=0,
+                )
+            orient_ids = orient_ids[:V]
+            oe = self.orient_embed(orient_ids).unsqueeze(1)  # [V,1,D]
+            x = x + oe
+
+        # 展平成 [N, D]，N = V * L
+        x_flat = x.reshape(V * L, D)  # [N,D]
+
+        # ------ 2) cross-attention：M 个 slot 去收集所有 patch ------
+        slots0 = self.slot_embed.to(device)          # [M, d_attn]
+        q = self.q_proj(slots0)                      # [M, d_attn]
+        k = self.k_proj(x_flat)                      # [N, d_attn]
+        v = self.v_proj(x_flat)                      # [N, d_attn]
+
+        d_attn = k.size(-1)
+        attn_logits = (q @ k.t()) / math.sqrt(d_attn)  # [M, N]
+        attn = attn_logits.softmax(dim=-1)             # [M, N]
+
+        z = attn @ v                    # [M, d_attn]
+        z = self.o_proj(z)              # [M, D]
+        z = z + self.ffn(self.norm(z))  # [M, D]
+
+        # ------ 3) 计算 slot 正则（多样性 + 视图覆盖）------
+        self._compute_regularizers(attn, V, L, device)
+
+        return z, attn
+
+    def _compute_regularizers(self, attn: torch.Tensor, V: int, L: int, device):
+        """
+        计算两种 slot 正则：
+        - diversity：不同 slot 的注意力分布尽量不重叠
+        - view coverage：鼓励所有视图都被关注到，而不是只看某一个视图
+
+        attn: (M, N) 的注意力矩阵（softmax 后），N = V * L
+        V:  视图数
+        L:  每个视图的 patch 数
+        """
+        M, N = attn.shape
+
+        # 形状不对就直接清空正则（不会参与 loss）
+        if V <= 0 or L <= 0 or N != V * L:
+            self.last_div_loss = None
+            self.last_cov_loss = None
+            return
+
+        # -------- 1) Slot Diversity 正则 --------
+        # A: (M, N)
+        A = attn
+
+        # AA^T: (M, M)，理想情况是接近单位阵 I
+        AA = A @ A.t()
+        I = torch.eye(M, device=device, dtype=A.dtype)
+        self.last_div_loss = ((AA - I) ** 2).mean()
+
+        # -------- 2) View Coverage 正则 --------
+        # 先把 patch 维度按 (视图, patch) 拆开
+        # A_view: (M, V, L)
+        A_view = A.view(M, V, L)
+
+        # 对每个 slot，在每个视图上累加 attention，再对 slot 求平均：
+        # view_mass: (V,)
+        view_mass = A_view.sum(-1).mean(0)
+
+        # 归一化成概率分布 p
+        p = torch.softmax(view_mass, dim=-1)
+
+        # 希望它接近均匀分布 [1/V, 1/V, ..., 1/V]
+        uniform = torch.full_like(p, 1.0 / V)
+        self.last_cov_loss = ((p - uniform) ** 2).mean()        
 
 
 # 这个类定义了多模态基础模型，结合视觉编码器和语言模型
@@ -162,13 +335,23 @@ class LlavaMetaForCausalLM(ABC):
         return image_features
 
 
-    def prepare_inputs_labels_for_multimodal(                   # 准备多模态输入和标签
-        self, input_ids, attention_mask, past_key_values, labels, images
+    # [2025-12-8] 接收 view_ids / orient_ids 并调用 slot_fusion
+    def prepare_inputs_labels_for_multimodal(
+            self,
+            input_ids,
+            attention_mask,
+            past_key_values,
+            labels,
+            images,
+            view_ids=None,
+            orient_ids=None,
     ):
         vision_tower = self.get_vision_tower()
 
-        # [2025-11-27] 每次调用先清空上一轮的缓存
+        # [2025-12-8] 每次调用先清空上一轮的缓存
         self._last_study_image_global = None
+        self._last_slot_div_loss = None
+        self._last_slot_cov_loss = None
 
         # 输入验证和处理
         if vision_tower is None or images is None or input_ids.shape[1] == 1:           # 如果没有视觉编码器或图像，或输入仅包含单个token，则不进行多模态处理
@@ -214,43 +397,96 @@ class LlavaMetaForCausalLM(ABC):
             # encode_images 返回 (B, N_patch, D)，第 0 维就是 batch 维
         #     image_features = self.encode_images(images)
 
-            # 3）对每个样本，进行黑盒 view-attention 融合
-            model = self.get_model()
-            view_attn = getattr(model, "view_attn", None)
+            # [2025-12-7] 修改 开始
+            # # 3）对每个样本，进行黑盒 view-attention 融合
+            # model = self.get_model()
+            # view_attn = getattr(model, "view_attn", None)
 
-            # [2025-11-30] 修改加权融合方法，用“残差插值”的方式融合：baseline + 小偏移
+            # # [2025-11-30] 修改加权融合方法，用“残差插值”的方式融合：baseline + 小偏移
+            # fused_features = []
+            # for x in per_sample:
+            #     # x: (V, N_patch, D_lm)
+            #     V, Np, D = x.shape
+
+            #     # ① baseline：简单平均（完全在原有空间里）
+            #     baseline = x.mean(dim=0)   # (N_patch, D)
+
+            #     if view_attn is None:
+            #         fused = baseline
+            #         fused_features.append(fused)
+            #         continue
+
+            #     # ② view-attn 产生一组权重 β_v，得到“注意力融合”的结果
+            #     global_feats = x.mean(dim=1)         # (V, D)
+            #     scores = view_attn(global_feats)     # (V, 1)
+            #     weights = torch.softmax(scores, dim=0)
+            #     weights_ = weights.view(V, 1, 1)
+            #     attn_fused = (weights_ * x).sum(dim=0)    # (N_patch, D)
+
+            #     # ③ 残差插值：从 baseline 出发，只走一小步到 attn_fused
+            #     #    lambda 可以先手动设小一点，例如 0.3
+            #     lambda_ = float(os.environ.get("MV_LAMBDA", "0.05"))
+
+            #     fused = (1.0 - lambda_) * baseline + lambda_ * attn_fused
+
+            #     fused_features.append(fused)
+
+            # # 最终每个样本是 (N_patch, D_lm)
+            # # ✅ [2025-11-29] 暂时统一用简单平均做多视图融合（完全恢复你当初的 baseline）
+            # # fused_features = [x.mean(dim=0) for x in per_sample]      # list[Tensor(N_patch, D)]
+            # image_features = fused_features
+            # 3）对每个样本，做 multi-slot study-level 融合：
+            #    - 先把所有视图的 patch 展平成一个序列 X_all ∈ R^{(V·L)×D}
+            #    - 再用 M 个 latent 槽位做 cross-attention，得到 M 个 study-level token
+            # [2025-12-8] 多-slot study-level 融合 + slot 正则
+            model = self.get_model()
+            slot_module = getattr(model, "slot_fusion", None)
+            if slot_module is None:
+                raise RuntimeError(
+                    "slot_fusion is not found on core model; "
+                    "please make sure LlavaLlamaModel.__init__ initializes it."
+                )
+
             fused_features = []
-            for x in per_sample:
+            div_losses = []
+            cov_losses = []
+
+            # view_ids / orient_ids: list[Tensor] or None
+            view_ids_list = view_ids if view_ids is not None else [None] * len(per_sample)
+            orient_ids_list = orient_ids if orient_ids is not None else [None] * len(per_sample)
+
+            for b, x in enumerate(per_sample):
                 # x: (V, N_patch, D_lm)
                 V, Np, D = x.shape
 
-                # ① baseline：简单平均（完全在原有空间里）
-                baseline = x.mean(dim=0)   # (N_patch, D)
+                v_ids = None
+                o_ids = None
+                if view_ids_list[b] is not None:
+                    v_ids = view_ids_list[b][:V]  # [V]
+                if orient_ids_list[b] is not None:
+                    o_ids = orient_ids_list[b][:V]
 
-                if view_attn is None:
-                    fused = baseline
-                    fused_features.append(fused)
-                    continue
+                # 直接把 (V, L, D) 交给 slot_fusion
+                slots, _ = slot_module(x, view_ids=v_ids, orient_ids=o_ids)   # slots: (M, D_lm)
 
-                # ② view-attn 产生一组权重 β_v，得到“注意力融合”的结果
-                global_feats = x.mean(dim=1)         # (V, D)
-                scores = view_attn(global_feats)     # (V, 1)
-                weights = torch.softmax(scores, dim=0)
-                weights_ = weights.view(V, 1, 1)
-                attn_fused = (weights_ * x).sum(dim=0)    # (N_patch, D)
+                fused_features.append(slots)
 
-                # ③ 残差插值：从 baseline 出发，只走一小步到 attn_fused
-                #    lambda 可以先手动设小一点，例如 0.3
-                lambda_ = float(os.environ.get("MV_LAMBDA", "0.05"))
+                if slot_module.last_div_loss is not None:
+                    div_losses.append(slot_module.last_div_loss)
+                if slot_module.last_cov_loss is not None:
+                    cov_losses.append(slot_module.last_cov_loss)
 
-                fused = (1.0 - lambda_) * baseline + lambda_ * attn_fused
-
-                fused_features.append(fused)
-
-            # 最终每个样本是 (N_patch, D_lm)
-            # ✅ [2025-11-29] 暂时统一用简单平均做多视图融合（完全恢复你当初的 baseline）
-            # fused_features = [x.mean(dim=0) for x in per_sample]      # list[Tensor(N_patch, D)]
+            # 每个 study 有 M 个 slot token
             image_features = fused_features
+
+            # 把 batch 内的 slot 正则平均一下，缓存到模型上，稍后在 forward 里加到 loss
+            self._last_slot_div_loss = (
+                torch.stack(div_losses).mean() if len(div_losses) > 0 else None
+            )
+            self._last_slot_cov_loss = (
+                torch.stack(cov_losses).mean() if len(cov_losses) > 0 else None
+            )
+
         else:
             # 单视图路径：images 为 (B, 3, H, W)
             image_features = self.encode_images(images)  # (B, N_patch, D_lm)
