@@ -32,7 +32,8 @@ import torch
 import math
 import transformers
 
-from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, \
+    DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
 
@@ -42,14 +43,15 @@ from llava.mm_utils import tokenizer_image_token, open_image_with_retry
 from llava.utils import data_loaders
 
 from PIL import Image, ImageFile
+
 # https://stackoverflow.com/questions/12984426/pil-ioerror-image-file-truncated-with-big-images
-ImageFile.LOAD_TRUNCATED_IMAGES = True      # 防止因为几张损坏的图像而导致整个程序崩溃
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # 防止因为几张损坏的图像而导致整个程序崩溃
 
 # ====== [2025-12-8] 多视角 metadata 词表（用于 embedding 编码） ======
 VIEW_VOCAB = {
     "PA": 0,
     "AP": 1,
-    "LATERAL": 2,      # 包括 LAT, LL, RL 等都可以归到这里
+    "LATERAL": 2,  # 包括 LAT, LL, RL 等都可以归到这里
     "OTHER": 3,
 }
 ORIENT_VOCAB = {
@@ -57,100 +59,100 @@ ORIENT_VOCAB = {
     "Supine": 1,
     "Other": 2,
 }
-VIEW_PAD_ID = len(VIEW_VOCAB)      # 4
+VIEW_PAD_ID = len(VIEW_VOCAB)  # 4
 ORIENT_PAD_ID = len(ORIENT_VOCAB)  # 3
-
 
 local_rank = None
 
 
 # 仅在主进程（local_rank == 0）打印，用于分布式时避免重复输出
 def rank0_print(*args):
-    if local_rank == 0:         # 用于分布式训练判断当前进程是否是 rank0（主进程），是的话，则进行打印
+    if local_rank == 0:  # 用于分布式训练判断当前进程是否是 rank0（主进程），是的话，则进行打印
         print(*args)
 
 
 # 一组模型相关参数，包括 模型路径、vision_tower、projector 类型、是否冻结 backbone、视觉 token 的一些开关等
 @dataclass
-class ModelArguments:           # 控制模型选择与结构级别的多模态选项
-    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")      # 基础模型路径或名称
-    version: Optional[str] = field(default="v0")                                # LLaVA 版本号
-    freeze_backbone: bool = field(default=False)                                # 是否冻结预训练模型的参数，默认为False
-    tune_mm_mlp_adapter: bool = field(default=False)                            # 是否只微调多模态 MLP 适配器
-    vision_tower: Optional[str] = field(default=None)                           # 视觉塔模型名称或路径
-    vision_tower_config: Optional[str] = field(default=None)                    # 视觉塔配置文件路径
-    vision_tower_checkpoint: Optional[str] = field(default=None)                # 视觉塔检查点路径
-    mm_vision_select_layer: Optional[int] = field(default=-1)                   # 多模态视觉特征选择层，默认 -1（最后一层）
-    pretrain_mm_mlp_adapter: Optional[str] = field(default=None)                # 预训练的多模态 MLP 适配器路径，用于初始化，默认为None
-    mm_projector_type: Optional[str] = field(default='linear')                  # 多模态投影器类型，默认 'linear'（线性投影）
-    mm_use_im_start_end: bool = field(default=False)                            # 多模态是否在图像标记中使用开始和结束标记，默认为 False
-    mm_use_im_patch_token: bool = field(default=True)                           # 多模态是否使用图像补丁标记，默认为 True
-    mm_vision_select_feature: Optional[str] = field(default="patch")            # 多模态视觉特征选择方式，默认 "patch"（补丁特征）
+class ModelArguments:  # 控制模型选择与结构级别的多模态选项
+    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")  # 基础模型路径或名称
+    version: Optional[str] = field(default="v0")  # LLaVA 版本号
+    freeze_backbone: bool = field(default=False)  # 是否冻结预训练模型的参数，默认为False
+    tune_mm_mlp_adapter: bool = field(default=False)  # 是否只微调多模态 MLP 适配器
+    vision_tower: Optional[str] = field(default=None)  # 视觉塔模型名称或路径
+    vision_tower_config: Optional[str] = field(default=None)  # 视觉塔配置文件路径
+    vision_tower_checkpoint: Optional[str] = field(default=None)  # 视觉塔检查点路径
+    mm_vision_select_layer: Optional[int] = field(default=-1)  # 多模态视觉特征选择层，默认 -1（最后一层）
+    pretrain_mm_mlp_adapter: Optional[str] = field(default=None)  # 预训练的多模态 MLP 适配器路径，用于初始化，默认为None
+    mm_projector_type: Optional[str] = field(default='linear')  # 多模态投影器类型，默认 'linear'（线性投影）
+    mm_use_im_start_end: bool = field(default=False)  # 多模态是否在图像标记中使用开始和结束标记，默认为 False
+    mm_use_im_patch_token: bool = field(default=True)  # 多模态是否使用图像补丁标记，默认为 True
+    mm_vision_select_feature: Optional[str] = field(default="patch")  # 多模态视觉特征选择方式，默认 "patch"（补丁特征）
 
 
 # 多视角数据集加载会涉及到DataArguments类
 # 数据/加载相关参数，包括 data_path、loader、是否 lazy_preprocess、是否 multimodal、image_folder、图像相关配置等
 @dataclass
-class DataArguments:                        # 控制数据集加载与预处理选项
+class DataArguments:  # 控制数据集加载与预处理选项
     data_path: str = field(default=None,
-                           metadata={"help": "Path to the training data."})     # 训练数据路径，默认为 None
-    loader: str = "default"                                                     # 数据加载器类型，默认使用 "default" 加载器
-    lazy_preprocess: bool = False                                               # 是否启用延迟预处理，默认为 False
-    is_multimodal: bool = False                                                 # 是否为多模态数据集，默认为 False             
-    image_folder: Optional[str] = field(default=None)                           # 图像文件夹路径，默认为 None
-    image_aspect_ratio: str = 'square'                                          # 图像宽高比，默认 'square'（正方形）   
-    image_grid_pinpoints: Optional[str] = field(default=None)                   # 图像网格关键点，默认为 None
+                           metadata={"help": "Path to the training data."})  # 训练数据路径，默认为 None
+    loader: str = "default"  # 数据加载器类型，默认使用 "default" 加载器
+    lazy_preprocess: bool = False  # 是否启用延迟预处理，默认为 False
+    is_multimodal: bool = False  # 是否为多模态数据集，默认为 False
+    image_folder: Optional[str] = field(default=None)  # 图像文件夹路径，默认为 None
+    image_aspect_ratio: str = 'square'  # 图像宽高比，默认 'square'（正方形）
+    image_grid_pinpoints: Optional[str] = field(default=None)  # 图像网格关键点，默认为 None
 
 
 # 扩展 HF 的训练参数，新增了 bits、lora_*、group_by_modality_length 等训练控制参数
 @dataclass
-class TrainingArguments(transformers.TrainingArguments):            # 扩展 HF 的 TrainingArguments，添加自定义训练参数
-    cache_dir: Optional[str] = field(default=None)                  # 缓存目录，默认为 None
-    optim: str = field(default="adamw_torch")                       # 优化器类型，默认 "adamw_torch"（AdamW 优化器）
-    remove_unused_columns: bool = field(default=False)              # 是否移除未使用的数据列，默认为 False
-    freeze_mm_mlp_adapter: bool = field(default=False)              # 是否冻结多模态 MLP 适配器，默认为 False
-    mpt_attn_impl: Optional[str] = field(default="triton")          # MPT 注意力实现方式，默认 "triton"
-    model_max_length: int = field(          # 模型最大序列长度，默认 512。序列会被右填充（可能被截断）
-        default=512,            
+class TrainingArguments(transformers.TrainingArguments):  # 扩展 HF 的 TrainingArguments，添加自定义训练参数
+    cache_dir: Optional[str] = field(default=None)  # 缓存目录，默认为 None
+    optim: str = field(default="adamw_torch")  # 优化器类型，默认 "adamw_torch"（AdamW 优化器）
+    remove_unused_columns: bool = field(default=False)  # 是否移除未使用的数据列，默认为 False
+    freeze_mm_mlp_adapter: bool = field(default=False)  # 是否冻结多模态 MLP 适配器，默认为 False
+    mpt_attn_impl: Optional[str] = field(default="triton")  # MPT 注意力实现方式，默认 "triton"
+    model_max_length: int = field(  # 模型最大序列长度，默认 512。序列会被右填充（可能被截断）
+        default=512,
         metadata={
             "help":
-            "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
+                "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
         },
     )
-    double_quant: bool = field(             # 是否使用双重量化，默认 True。通过双重量化压缩量化统计信息
+    double_quant: bool = field(  # 是否使用双重量化，默认 True。通过双重量化压缩量化统计信息
         default=True,
         metadata={"help": "Compress the quantization statistics through double quantization."}
     )
-    quant_type: str = field(                # 量化数据类型，默认 "nf4"。可选 "fp4" 或 "nf4"
+    quant_type: str = field(  # 量化数据类型，默认 "nf4"。可选 "fp4" 或 "nf4"
         default="nf4",
         metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."}
     )
-    bits: int = field(                      # 量化位数，默认 16。可选 4、8、16
+    bits: int = field(  # 量化位数，默认 16。可选 4、8、16
         default=16,
         metadata={"help": "How many bits to use."}
     )
     # LoRA 相关参数
-    lora_enable: bool = False               # 是否启用 LoRA（Low-Rank Adaptation），默认为 False
-    lora_r: int = 64                        # LoRA 矩阵秩，默认 64
-    lora_alpha: int = 16                    # LoRA alpha 参数（缩放系数），默认 16
-    lora_dropout: float = 0.05              # LoRA 的 dropout 率，默认 0.05
-    lora_weight_path: str = ""              # 预训练 LoRA 权重路径，默认为空字符串
-    lora_bias: str = "none"                 # LoRA 偏置处理方式，默认 "none"（可选 "none"、"all"、"lora_only"）
-    group_by_modality_length: bool = field(default=False)           # 是否按模态长度分组，默认为 False
+    lora_enable: bool = False  # 是否启用 LoRA（Low-Rank Adaptation），默认为 False
+    lora_r: int = 64  # LoRA 矩阵秩，默认 64
+    lora_alpha: int = 16  # LoRA alpha 参数（缩放系数），默认 16
+    lora_dropout: float = 0.05  # LoRA 的 dropout 率，默认 0.05
+    lora_weight_path: str = ""  # 预训练 LoRA 权重路径，默认为空字符串
+    lora_bias: str = "none"  # LoRA 偏置处理方式，默认 "none"（可选 "none"、"all"、"lora_only"）
+    group_by_modality_length: bool = field(default=False)  # 是否按模态长度分组，默认为 False
+
 
 # DeepSpeed ZeRO 是微软DeepSpeed框架中的一种内存优化技术，ZeRO3是其中的第三阶段，提供了最极致的内存优化。
 # 辅助函数，和 DeepSpeed ZeRO3 相关的 wrapper（用于在 ZeRO 环境下安全访问参数 / state）
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
     from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-    if hasattr(param, "ds_id"):         # 判断参数是否属于 DeepSpeed ZeRO3 管理的参数，是否有 ds_id 属性（有这个属性说明参数正在使用 ZeRO 优化）
-        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:            # 检查参数状态是否为 NOT_AVAILABLE（表示参数当前不可用，可能在其他设备上）
-            if not ignore_status:                   # 如果 ignore_status 为 False 且参数状态不是 NOT_AVAILABLE，记录警告日志
+    if hasattr(param, "ds_id"):  # 判断参数是否属于 DeepSpeed ZeRO3 管理的参数，是否有 ds_id 属性（有这个属性说明参数正在使用 ZeRO 优化）
+        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:  # 检查参数状态是否为 NOT_AVAILABLE（表示参数当前不可用，可能在其他设备上）
+            if not ignore_status:  # 如果 ignore_status 为 False 且参数状态不是 NOT_AVAILABLE，记录警告日志
                 logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
-        with zero.GatheredParameters([param]):          # 使用 DeepSpeed 的 GatheredParameters 上下文管理器
-            param = param.data.detach().cpu().clone()           # 在参数收集的上下文中，获取参数的张量数据
+        with zero.GatheredParameters([param]):  # 使用 DeepSpeed 的 GatheredParameters 上下文管理器
+            param = param.data.detach().cpu().clone()  # 在参数收集的上下文中，获取参数的张量数据
     else:
-        param = param.detach().cpu().clone()        # 如果参数不属于 ZeRO3 管理，直接执行相同的操作：分离、移动到 CPU、克隆
+        param = param.detach().cpu().clone()  # 如果参数不属于 ZeRO3 管理，直接执行相同的操作：分离、移动到 CPU、克隆
     return param
 
 
@@ -184,7 +186,7 @@ def get_peft_state_maybe_zero_3(named_params, bias):
 # 提取非LoRA的PEFT参数
 def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
     to_return = {k: t for k, t in named_params if "lora_" not in k}
-    if require_grad_only:                   # 如果 require_grad_only 为 True，只保留需要梯度的参数
+    if require_grad_only:  # 如果 require_grad_only 为 True，只保留需要梯度的参数
         to_return = {k: t for k, t in to_return.items() if t.requires_grad}
     to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
     return to_return
@@ -201,13 +203,13 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    for name, module in model.named_modules():          # 遍历模型的所有模块
-        if isinstance(module, cls):                     # 如果是线性层，提取其名称的最后一部分
+    for name, module in model.named_modules():  # 遍历模型的所有模块
+        if isinstance(module, cls):  # 如果是线性层，提取其名称的最后一部分
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
     # 如果包含语言模型头（lm_head），将其移除
-    if 'lm_head' in lora_module_names: # needed for 16-bit
+    if 'lm_head' in lora_module_names:  # needed for 16-bit
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
 
@@ -258,18 +260,19 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
 # 文本输入 → Tokenizer → token IDs → input_embeddings → 模型编码 → 隐藏状态 → output_embeddings → 词汇概率
 # 智能调整tokenizer和模型embedding层的大小，以适配新的特殊token(除了常规文本词汇外，具有特殊功能的token，如图像token，视频token等)
 def smart_tokenizer_and_embedding_resize(
-    special_tokens_dict: Dict,
-    tokenizer: transformers.PreTrainedTokenizer,
-    model: transformers.PreTrainedModel,
+        special_tokens_dict: Dict,
+        tokenizer: transformers.PreTrainedTokenizer,
+        model: transformers.PreTrainedModel,
 ):
     """Resize tokenizer and embedding.
 
     Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
     """
-    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)          # 向tokenizer添加新的特殊token（tokenizer是将文本转换为模型可理解数字的工具）
-    model.resize_token_embeddings(len(tokenizer))                               # 调整模型的token embedding层大小以匹配新的tokenizer大小
+    num_new_tokens = tokenizer.add_special_tokens(
+        special_tokens_dict)  # 向tokenizer添加新的特殊token（tokenizer是将文本转换为模型可理解数字的工具）
+    model.resize_token_embeddings(len(tokenizer))  # 调整模型的token embedding层大小以匹配新的tokenizer大小
 
-    if num_new_tokens > 0:                               # 只有当确实添加了新token时才进行初始化
+    if num_new_tokens > 0:  # 只有当确实添加了新token时才进行初始化
         input_embeddings = model.get_input_embeddings().weight.data
         output_embeddings = model.get_output_embeddings().weight.data
 
@@ -286,23 +289,23 @@ def smart_tokenizer_and_embedding_resize(
 def _tokenize_fn(strings: Sequence[str],
                  tokenizer: transformers.PreTrainedTokenizer) -> Dict:
     """Tokenize a list of strings."""
-    tokenized_list = [                      # 对每个文本字符串应用tokenizer
+    tokenized_list = [  # 对每个文本字符串应用tokenizer
         tokenizer(
             text,
-            return_tensors="pt",            # 返回PyTorch tensor格式
-            padding="longest",              # 按最长序列进行填充，确保批次内所有序列长度一致
-            max_length=tokenizer.model_max_length,          # 最大长度限制，防止过长序列
-            truncation=True,                # 超过最大长度时进行截断
+            return_tensors="pt",  # 返回PyTorch tensor格式
+            padding="longest",  # 按最长序列进行填充，确保批次内所有序列长度一致
+            max_length=tokenizer.model_max_length,  # 最大长度限制，防止过长序列
+            truncation=True,  # 超过最大长度时进行截断
         ) for text in strings
     ]
-    input_ids = labels = [                  # 从每个分词结果中提取第一个序列的input_ids
+    input_ids = labels = [  # 从每个分词结果中提取第一个序列的input_ids
         tokenized.input_ids[0] for tokenized in tokenized_list
     ]
     input_ids_lens = labels_lens = [
-        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item()         # 创建布尔掩码，非填充token为True。统计非填充token的数量，得到实际序列长度
+        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item()  # 创建布尔掩码，非填充token为True。统计非填充token的数量，得到实际序列长度
         for tokenized in tokenized_list
     ]
-    return dict(                            # 返回结构化数据，包含分词结果和长度信息
+    return dict(  # 返回结构化数据，包含分词结果和长度信息
         input_ids=input_ids,
         labels=labels,
         input_ids_lens=input_ids_lens,
@@ -313,12 +316,12 @@ def _tokenize_fn(strings: Sequence[str],
 # 在对话数据中掩码特定的loss计算区域
 def _mask_targets(target, tokenized_lens, speakers):
     # cur_idx = 0
-    cur_idx = tokenized_lens[0]             # 初始化当前位置，跳过系统提示部分
+    cur_idx = tokenized_lens[0]  # 初始化当前位置，跳过系统提示部分
     tokenized_lens = tokenized_lens[1:]
-    target[:cur_idx] = IGNORE_INDEX         # 将当前位置之前的所有token设置为IGNORE_INDEX，在loss计算时忽略
-    for tokenized_len, speaker in zip(tokenized_lens, speakers):            # 遍历对话轮次，根据说话者类型进行掩码
+    target[:cur_idx] = IGNORE_INDEX  # 将当前位置之前的所有token设置为IGNORE_INDEX，在loss计算时忽略
+    for tokenized_len, speaker in zip(tokenized_lens, speakers):  # 遍历对话轮次，根据说话者类型进行掩码
         if speaker == "human":
-            target[cur_idx+2:cur_idx + tokenized_len] = IGNORE_INDEX
+            target[cur_idx + 2:cur_idx + tokenized_len] = IGNORE_INDEX
         cur_idx += tokenized_len
 
 
@@ -346,34 +349,36 @@ def _add_speaker_and_signal(header, source, get_conversation=True):
 
 # 预处理多模态数据，处理图像token的插入和格式化
 def preprocess_multimodal(
-    sources: Sequence[str],
-    data_args: DataArguments
+        sources: Sequence[str],
+        data_args: DataArguments
 ) -> Dict:
-    is_multimodal = data_args.is_multimodal                 # 从数据参数获取是否是多模态数据
+    is_multimodal = data_args.is_multimodal  # 从数据参数获取是否是多模态数据
     if not is_multimodal:
         return sources
 
-    for source in sources:                  # 外层循环：遍历每个对话样本
-        for sentence in source:             # 内层循环：遍历对话中的每个句子
-            if DEFAULT_IMAGE_TOKEN in sentence['value']:                # 检查当前句子中是否包含默认图像token，只有在包含图像token的句子才需要进行特殊处理
-                sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()          # 将图像token从原位置移除，使用strip()去除首尾空白字符
-                sentence['value'] = DEFAULT_IMAGE_TOKEN + '\n' + sentence['value']                      # 将图像token移动到句子开头，并添加换行符
-                sentence['value'] = sentence['value'].strip()                                           # 去除因添加换行可能产生的多余空白
-                if "mmtag" in conversation_lib.default_conversation.version:                    # 如果对话版本包含 "mmtag"，则使用特定的图像标记格式
-                    sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '<Image>' + DEFAULT_IMAGE_TOKEN + '</Image>')
-            replace_token = DEFAULT_IMAGE_TOKEN                         # 准备替换图像token
-            if data_args.mm_use_im_start_end:                           # 如果配置要求使用图像开始和结束标记
+    for source in sources:  # 外层循环：遍历每个对话样本
+        for sentence in source:  # 内层循环：遍历对话中的每个句子
+            if DEFAULT_IMAGE_TOKEN in sentence['value']:  # 检查当前句子中是否包含默认图像token，只有在包含图像token的句子才需要进行特殊处理
+                sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN,
+                                                              '').strip()  # 将图像token从原位置移除，使用strip()去除首尾空白字符
+                sentence['value'] = DEFAULT_IMAGE_TOKEN + '\n' + sentence['value']  # 将图像token移动到句子开头，并添加换行符
+                sentence['value'] = sentence['value'].strip()  # 去除因添加换行可能产生的多余空白
+                if "mmtag" in conversation_lib.default_conversation.version:  # 如果对话版本包含 "mmtag"，则使用特定的图像标记格式
+                    sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN,
+                                                                  '<Image>' + DEFAULT_IMAGE_TOKEN + '</Image>')
+            replace_token = DEFAULT_IMAGE_TOKEN  # 准备替换图像token
+            if data_args.mm_use_im_start_end:  # 如果配置要求使用图像开始和结束标记
                 replace_token = DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
-            sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)           # 将原始图像token替换为处理后的版本
+            sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)  # 将原始图像token替换为处理后的版本
 
     return sources
 
 
 # LLaMA-2格式预处理
 def preprocess_llama_2(
-    sources,
-    tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+        sources,
+        tokenizer: transformers.PreTrainedTokenizer,
+        has_image: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -395,7 +400,8 @@ def preprocess_llama_2(
     # Tokenize conversations
 
     if has_image:
-        input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+        input_ids = torch.stack(
+            [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
     else:
         input_ids = tokenizer(
             conversations,
@@ -433,7 +439,7 @@ def preprocess_llama_2(
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
-            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+            target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
         target[cur_len:] = IGNORE_INDEX
@@ -454,9 +460,9 @@ def preprocess_llama_2(
 
 # V1格式预处理
 def preprocess_v1(
-    sources,
-    tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+        sources,
+        tokenizer: transformers.PreTrainedTokenizer,
+        has_image: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -478,7 +484,8 @@ def preprocess_v1(
     # Tokenize conversations
 
     if has_image:
-        input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+        input_ids = torch.stack(
+            [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
     else:
         input_ids = tokenizer(
             conversations,
@@ -516,7 +523,7 @@ def preprocess_v1(
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
-            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+            target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
         target[cur_len:] = IGNORE_INDEX
@@ -537,8 +544,8 @@ def preprocess_v1(
 
 # MPT格式预处理
 def preprocess_mpt(
-    sources,
-    tokenizer: transformers.PreTrainedTokenizer,
+        sources,
+        tokenizer: transformers.PreTrainedTokenizer,
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -558,7 +565,8 @@ def preprocess_mpt(
         conversations.append(conv.get_prompt())
 
     # Tokenize conversations
-    input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+    input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations],
+                            dim=0)
     targets = input_ids.clone()
     assert conv.sep_style == conversation_lib.SeparatorStyle.MPT
 
@@ -568,9 +576,9 @@ def preprocess_mpt(
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
 
         rounds = conversation.split(conv.sep)
-        re_rounds = [conv.sep.join(rounds[:3])] # system + user + gpt
+        re_rounds = [conv.sep.join(rounds[:3])]  # system + user + gpt
         for conv_idx in range(3, len(rounds), 2):
-            re_rounds.append(conv.sep.join(rounds[conv_idx:conv_idx+2]))    # user + gpt
+            re_rounds.append(conv.sep.join(rounds[conv_idx:conv_idx + 2]))  # user + gpt
         cur_len = 0
         target[:cur_len] = IGNORE_INDEX
         for i, rou in enumerate(re_rounds):
@@ -583,7 +591,7 @@ def preprocess_mpt(
             parts[0] += sep
             round_len = len(tokenizer_image_token(rou, tokenizer)) + len(tokenizer_image_token(conv.sep, tokenizer))
             instruction_len = len(tokenizer_image_token(parts[0], tokenizer))
-            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+            target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
         target[cur_len:] = IGNORE_INDEX
@@ -604,8 +612,8 @@ def preprocess_mpt(
 
 # 简单格式预处理。处理最简单的对话格式，适用于基础的多模态任务。输入要求：严格的2轮对话（人类提问 + AI回答）
 def preprocess_plain(
-    sources: Sequence[str],
-    tokenizer: transformers.PreTrainedTokenizer,
+        sources: Sequence[str],
+        tokenizer: transformers.PreTrainedTokenizer,
 ) -> Dict:
     # add end signal and concatenate together
     conversations = []
@@ -627,9 +635,9 @@ def preprocess_plain(
 
 # 统一预处理分发器。根据对话风格自动选择对应的预处理函数，提供统一的预处理接口，支持多种对话格式
 def preprocess(
-    sources: Sequence[str],
-    tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+        sources: Sequence[str],
+        tokenizer: transformers.PreTrainedTokenizer,
+        has_image: bool = False
 ) -> Dict:
     """
     Given a list of sources, each is a conversation list. This transform:
@@ -652,6 +660,7 @@ def preprocess(
         header = f"{conversation_lib.default_conversation.system}\n\n"
         conversation = _add_speaker_and_signal(header, source)
         conversations.append(conversation)
+
     # tokenize conversations
     def get_tokenize_len(prompts):
         return [len(tokenizer_image_token(prompt, tokenizer)) for prompt in prompts]
@@ -719,7 +728,7 @@ class LazySupervisedDataset(Dataset):
 
         # ---------- ① 处理图像（支持多视角） ----------
         if 'image' in sources[0]:
-            img_field = self.list_data_dict[i]['image']      # 可能是 str 或 list[str]
+            img_field = self.list_data_dict[i]['image']  # 可能是 str 或 list[str]
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
 
@@ -766,7 +775,7 @@ class LazySupervisedDataset(Dataset):
 
                 img_tensor = processor.preprocess(
                     img, return_tensors='pt'
-                )['pixel_values'][0]      # (3, H, W)
+                )['pixel_values'][0]  # (3, H, W)
                 proc_tensors.append(img_tensor)
 
             # ★ 核心：一个 sample 的 image 现在是 (N_view, 3, H, W)
@@ -855,7 +864,7 @@ class LazySupervisedDataset(Dataset):
             if len(raw_orients_list) < n_views:
                 raw_orients_list = raw_orients_list + [raw_orients_list[-1]] * (n_views - len(raw_orients_list))
 
-            raw_views_list   = raw_views_list[:n_views]
+            raw_views_list = raw_views_list[:n_views]
             raw_orients_list = raw_orients_list[:n_views]
 
             # 映射到 ID（未知值 fallback 到 OTHER/Other）
@@ -873,7 +882,6 @@ class LazySupervisedDataset(Dataset):
             )
 
         return data_dict
-
 
 
 # 用来把多条样本拼成 batch（pad input_ids、pad labels 用 IGNORE_INDEX、构建 attention_mask、处理 images 的 stack/非一致 shape 情况）
@@ -913,7 +921,6 @@ class DataCollatorForSupervisedDataset(object):
             if "orient_ids" in instances[0]:
                 batch["orient_ids"] = [ins["orient_ids"] for ins in instances]
 
-
         return batch
 
 
@@ -922,8 +929,8 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
-                                data_path=data_args.data_path,
-                                data_args=data_args)
+                                          data_path=data_args.data_path,
+                                          data_args=data_args)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset,
                 eval_dataset=None,
@@ -956,13 +963,13 @@ def train():
                 llm_int8_has_fp16_weight=False,
                 bnb_4bit_compute_dtype=compute_dtype,
                 bnb_4bit_use_double_quant=training_args.double_quant,
-                bnb_4bit_quant_type=training_args.quant_type # {'fp4', 'nf4'}
+                bnb_4bit_quant_type=training_args.quant_type  # {'fp4', 'nf4'}
             )
         ))
 
     # 模型加载
-    if model_args.vision_tower is not None:         # 如果有视觉塔，加载LLaVA模型
-        if 'mpt' in model_args.model_name_or_path:              # 如果是MPT模型
+    if model_args.vision_tower is not None:  # 如果有视觉塔，加载LLaVA模型
+        if 'mpt' in model_args.model_name_or_path:  # 如果是MPT模型
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
             config.attn_config['attn_impl'] = training_args.mpt_attn_impl
             model = LlavaMPTForCausalLM.from_pretrained(
@@ -971,13 +978,13 @@ def train():
                 cache_dir=training_args.cache_dir,
                 **bnb_model_from_pretrained_args
             )
-        else:                   # 否则，加载LLaVA-Llama模型
+        else:  # 否则，加载LLaVA-Llama模型
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
                 **bnb_model_from_pretrained_args
             )
-    else:           # 如果没有视觉塔，加载标准的LLaMA模型
+    else:  # 如果没有视觉塔，加载标准的LLaMA模型
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
@@ -1006,27 +1013,27 @@ def train():
 
     # 1. 冻结整个 backbone
     core.requires_grad_(False)
-    
+
     # 2. 冻结 lm_head（输出层）
     for p in model.lm_head.parameters():
         p.requires_grad_(False)
-    
+
     # 3. 重新打开你要训练的“新模块”
     train_modules = []
-    
+
     # [2025-12-7] 修改 开始
     # # 3. 允许训练 view_attn
     # if hasattr(core, "view_attn"):
     #     for p in core.view_attn.parameters():
     #         p.requires_grad_(True)
     #     train_modules.append("view_attn")
-    
+
     # # 4. 解冻 mm_projector
     # if hasattr(core, "mm_projector"):
     #     for p in core.mm_projector.parameters():
     #         p.requires_grad_(True)
     #     train_modules.append("mm_projector")
-    
+
     # print(f"[INFO] Training modules: {train_modules}")
     # 3.1 多-slot study-level 融合模块
     if hasattr(core, "slot_fusion"):
@@ -1061,6 +1068,7 @@ def train():
         for p in core.text_disease_head.parameters():
             p.requires_grad_(True)
         train_modules.append("text_disease_head")
+
     # [2025-12-7] 修改 结束
 
     # 4) 调试打印：看看到底在训谁
@@ -1077,12 +1085,12 @@ def train():
                 f"({n_trainable / n_total:.4f} of total)")
     for name, n in trainable:
         if any(k in name for k in train_modules):
-            rank0_print(f"  - {name}: {n/1e6:.2f}M params")
-
+            rank0_print(f"  - {name}: {n / 1e6:.2f}M params")
 
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training
-        model.config.torch_dtype=(torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+        model.config.torch_dtype = (
+            torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
     # 梯度检查点：用时间换空间，减少显存占用
@@ -1092,24 +1100,51 @@ def train():
         else:
             def make_inputs_require_grad(module, input, output):
                 output.requires_grad_(True)
+
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
     # LoRA适配器：添加低秩适配器进行参数高效微调
+    # if training_args.lora_enable:
+    #     from peft import LoraConfig, get_peft_model
+    #     lora_config = LoraConfig(
+    #         r=training_args.lora_r,
+    #         lora_alpha=training_args.lora_alpha,
+    #         target_modules=find_all_linear_names(model),
+    #         lora_dropout=training_args.lora_dropout,
+    #         bias=training_args.lora_bias,
+    #         task_type="CAUSAL_LM",
+    #     )
+    #     if training_args.bits == 16:
+    #         if training_args.bf16:
+    #             model.to(torch.bfloat16)
+    #         if training_args.fp16:
+    #             model.to(torch.float16)
+    #     rank0_print("Adding LoRA adapters...")
+    #     model = get_peft_model(model, lora_config)
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
+
+        # 明确指定只在注意力和 MLP 的 Linear 上加 LoRA
+        target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",  # self-attn
+            "gate_proj", "up_proj", "down_proj",  # MLP
+        ]
+
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
+            target_modules=target_modules,
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
         )
+
         if training_args.bits == 16:
             if training_args.bf16:
                 model.to(torch.bfloat16)
             if training_args.fp16:
                 model.to(torch.float16)
+
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
@@ -1153,7 +1188,7 @@ def train():
             model_args=model_args,
             fsdp=training_args.fsdp
         )
-        
+
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
@@ -1199,30 +1234,30 @@ def train():
                         module = module.to(torch.bfloat16)
 
     # 训练执行
-    data_module = make_supervised_data_module(tokenizer=tokenizer,                      # 数据准备：创建数据加载模块
+    data_module = make_supervised_data_module(tokenizer=tokenizer,  # 数据准备：创建数据加载模块
                                               data_args=data_args)
-    trainer = LLaVATrainer(model=model,                 # 训练器初始化：创建LLaVA专用的训练器
-                    tokenizer=tokenizer,
-                    args=training_args,
-                    **data_module)
+    trainer = LLaVATrainer(model=model,  # 训练器初始化：创建LLaVA专用的训练器
+                           tokenizer=tokenizer,
+                           args=training_args,
+                           **data_module)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):           # 检查是否有已有的检查点，支持断点续训
+    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):  # 检查是否有已有的检查点，支持断点续训
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
-    trainer.save_state()            # 状态保存：保存训练状态
+    trainer.save_state()  # 状态保存：保存训练状态
 
     # 模型保存
     model.config.use_cache = True
 
-    if training_args.lora_enable:           # 如果使用LoRA，保存LoRA适配器和非LoRA参数
+    if training_args.lora_enable:  # 如果使用LoRA，保存LoRA适配器和非LoRA参数
         state_dict = get_peft_state_maybe_zero_3(
             model.named_parameters(), training_args.lora_bias
         )
         non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
             model.named_parameters()
         )
-        if training_args.local_rank == 0 or training_args.local_rank == -1:             # 仅主进程保存模型，避免重复写入
+        if training_args.local_rank == 0 or training_args.local_rank == -1:  # 仅主进程保存模型，避免重复写入
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))

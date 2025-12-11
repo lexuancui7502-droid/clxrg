@@ -74,24 +74,33 @@ class MultiSlotFusion(nn.Module):
         """
         dim:       视觉特征维度（mm_projector 输出 = LLM hidden_size）
         num_slots: 槽位个数 M
-        attn_dim:  槽位内部注意力空间维度（默认 = dim//2，省显存）
-        ffn_hidden_dim: FFN 隐藏层维度（默认 = 2*dim，省显存）
+        attn_dim:  槽位注意力维度（默认 = dim//4，省显存）
+        ffn_hidden_dim: FFN 隐藏层维度（默认 = dim，省显存）
         """
         super().__init__()
         self.dim = dim
         self.num_slots = num_slots
 
-        # d_attn = attn_dim or (dim // 2)      # 例如 4096 -> 2048
-        # d_ffn = ffn_hidden_dim or (2 * dim)  # 例如 4096 -> 8192
+        # 你现在的设定：4096 -> 1024，FFN 用 dim
+        d_attn = attn_dim or (dim // 2)
+        d_ffn = ffn_hidden_dim or dim
 
-        d_attn = attn_dim or (dim // 4)      # 4096 -> 1024
-        d_ffn = ffn_hidden_dim or dim 
+        # ===== 视角 / 体位 embedding =====
+        # self.view_embed = nn.Embedding(num_view_types, dim)
+        # self.orient_embed = nn.Embedding(num_orient_types, dim)
 
-        # 视角 / 体位 embedding（和视觉特征同维）
-        self.view_embed = nn.Embedding(num_view_types, dim)
-        self.orient_embed = nn.Embedding(num_orient_types, dim)
+        # 初始化得很小，避免一开始把视觉特征扰乱太厉害
+        # nn.init.normal_(self.view_embed.weight, mean=0.0, std=0.01)
+        # nn.init.normal_(self.orient_embed.weight, mean=0.0, std=0.01)
 
-        # M 个可学习的 slot 向量，在注意力空间 d_attn 里
+        # 控制它们的影响力（先设成常数 0.1，后面需要可以改成 nn.Parameter）
+        # self.view_scale = 0.0
+        # self.orient_scale = 0.0
+        # 如果想让模型自己学，可以写：
+        # self.view_scale = nn.Parameter(torch.tensor(0.1))
+        # self.orient_scale = nn.Parameter(torch.tensor(0.1))
+
+        # ===== 槽位参数 =====
         self.slot_embed = nn.Parameter(torch.randn(num_slots, d_attn))
 
         # Q/K/V 线性层（cross-attention）
@@ -108,7 +117,7 @@ class MultiSlotFusion(nn.Module):
             nn.Linear(d_ffn, dim),
         )
 
-        # 存最近一次 forward 的正则项（注意：名字一定要和 llava_arch 里访问的一致）
+        # 正则缓存（名字要和 llava_arch 里一致）
         self.last_div_loss = None   # slot diversity loss
         self.last_cov_loss = None   # view coverage loss
 
@@ -128,33 +137,33 @@ class MultiSlotFusion(nn.Module):
         device = x.device
 
         # ------ 1) 加视角 / 体位 embedding ------
-        if view_ids is not None:
-            view_ids = view_ids.to(device)
-            if view_ids.ndim == 0:
-                view_ids = view_ids.unsqueeze(0)
-            if view_ids.numel() < V:
-                view_ids = torch.cat(
-                    [view_ids,
-                     view_ids.new_full((V - view_ids.numel(),), view_ids[-1].item())],
-                    dim=0,
-                )
-            view_ids = view_ids[:V]
-            ve = self.view_embed(view_ids).unsqueeze(1)  # [V,1,D]
-            x = x + ve
+        # if view_ids is not None:
+        #     view_ids = view_ids.to(device)
+        #     if view_ids.ndim == 0:
+        #         view_ids = view_ids.unsqueeze(0)
+        #     if view_ids.numel() < V:
+        #         view_ids = torch.cat(
+        #             [view_ids,
+        #              view_ids.new_full((V - view_ids.numel(),), view_ids[-1].item())],
+        #             dim=0,
+        #         )
+        #     view_ids = view_ids[:V]
+        #     ve = self.view_embed(view_ids).unsqueeze(1)  # [V,1,D]
+        #     x = x + self.view_scale * ve
 
-        if orient_ids is not None:
-            orient_ids = orient_ids.to(device)
-            if orient_ids.ndim == 0:
-                orient_ids = orient_ids.unsqueeze(0)
-            if orient_ids.numel() < V:
-                orient_ids = torch.cat(
-                    [orient_ids,
-                     orient_ids.new_full((V - orient_ids.numel(),), orient_ids[-1].item())],
-                    dim=0,
-                )
-            orient_ids = orient_ids[:V]
-            oe = self.orient_embed(orient_ids).unsqueeze(1)  # [V,1,D]
-            x = x + oe
+        # if orient_ids is not None:
+        #     orient_ids = orient_ids.to(device)
+        #     if orient_ids.ndim == 0:
+        #         orient_ids = orient_ids.unsqueeze(0)
+        #     if orient_ids.numel() < V:
+        #         orient_ids = torch.cat(
+        #             [orient_ids,
+        #              orient_ids.new_full((V - orient_ids.numel(),), orient_ids[-1].item())],
+        #             dim=0,
+        #         )
+        #     orient_ids = orient_ids[:V]
+        #     oe = self.orient_embed(orient_ids).unsqueeze(1)  # [V,1,D]
+        #     x = x + self.orient_scale * oe
 
         # 展平成 [N, D]，N = V * L
         x_flat = x.reshape(V * L, D)  # [N,D]
