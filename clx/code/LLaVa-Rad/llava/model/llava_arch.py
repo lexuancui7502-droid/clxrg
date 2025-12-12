@@ -455,6 +455,16 @@ class LlavaMetaForCausalLM(ABC):
                     "slot_fusion is not found on core model; "
                     "please make sure LlavaLlamaModel.__init__ initializes it."
                 )
+            
+            # === [2025-12-11] 新增：视图级注意力模块和超参数 ===
+            view_attn = getattr(model, "view_attn", None)
+
+            # MV_LAMBDA 控制视图 gating 的强度；默认 0 表示不启用
+            mv_lambda = float(os.environ.get("MV_LAMBDA", "0.0"))
+
+            # MV_TOPK_PATCH 控制 Top-K patch 的个数；默认 0 表示不启用
+            mv_topk = int(os.environ.get("MV_TOPK_PATCH", "0"))
+            # === [2025-12-11] 新增结束：视图级注意力模块和超参数 ===
 
             fused_features = []
             div_losses = []
@@ -475,10 +485,58 @@ class LlavaMetaForCausalLM(ABC):
                 if orient_ids_list[b] is not None:
                     o_ids = orient_ids_list[b][:V]
 
-                # 直接把 (V, L, D) 交给 slot_fusion
-                slots, _ = slot_module(x, view_ids=v_ids, orient_ids=o_ids)   # slots: (M, D_lm)
+                # === [2025-12-11] 新增 1) 视图级 gating：SimpleViewAttention 显式建模视图重要性 ===
+                if (view_attn is not None) and (V > 1) and (mv_lambda > 0.0):
+                    # 1.1 每个视图做 patch 平均，得到 (V, D) 的 global feature
+                    global_feats = x.mean(dim=1)                # (V, D)
 
-                fused_features.append(slots)
+                    # 1.2 SimpleViewAttention 输出每个视图的 score，再 softmax 成权重
+                    scores = view_attn(global_feats)            # (V, 1)
+                    weights = torch.softmax(scores, dim=0)      # (V, 1)
+
+                    # 1.3 把 (V,1) reshape 成 (V,1,1)，用于缩放每个视图的所有 patch
+                    weights_ = weights.view(V, 1, 1)            # (V, 1, 1)
+
+                    # 1.4 残差式 gating：从原始特征出发，只“走一小步”到加权特征，避免一开始破坏预训练分布
+                    gated_x = weights_ * x                      # (V, Np, D)
+                    x = (1.0 - mv_lambda) * x + mv_lambda * gated_x
+                    # 注意：这里直接重写 x，后面 slot_fusion 和 Top-K 都基于 gating 后的特征
+                    # === [2025-12-11] 新增结束
+
+
+                # 直接把 (V, L, D) 交给 slot_fusion
+                # slots, _ = slot_module(x, view_ids=v_ids, orient_ids=o_ids)   # slots: (M, D_lm)
+                # fused_features.append(slots)
+                
+                # === [2025-12-11] 2) 多-slot 融合：slots + Top-K patch ===
+                # 2.1 交给 slot_fusion，得到 M 个 slot token 和注意力矩阵 attn
+                slots, attn = slot_module(x, view_ids=v_ids, orient_ids=o_ids)   # slots: (M, D_lm), attn: (M, V*Np)
+
+                # 2.2 基于 slot 的注意力，在所有视图的 patch 上做全局 Top-K 选取
+                if mv_topk > 0:
+                    M, N_total = attn.shape               # N_total = V * Np
+                    K = min(mv_topk, N_total)             # 防止 K > patch 数
+
+                    # 2.2.1 为每个 patch 聚合一个 score，这里用 max over slots（你也可以换成 mean）
+                    patch_scores, _ = attn.max(dim=0)     # (N_total,)
+
+                    # 2.2.2 选出 score 最高的 K 个 patch 索引
+                    topk_scores, topk_idx = torch.topk(patch_scores, k=K, dim=-1)  # topk_idx: (K,)
+
+                    # 2.2.3 用同样的展平顺序从 x 中取出对应 patch 的特征
+                    x_flat = x.reshape(V * Np, D)         # (N_total, D)
+                    topk_tokens = x_flat[topk_idx]        # (K, D_lm)
+
+                    # 2.2.4 将 slots 和 Top-K patch token 在 token 维度拼接
+                    #       最终每个 study 的视觉 token 为 (M + K, D_lm)
+                    cur_feats = torch.cat([slots, topk_tokens], dim=0)
+                else:
+                    # 不启用 Top-K 时，保持原来的行为：只用 slots 作为视觉 token
+                    cur_feats = slots
+
+                # 2.3 加入 fused_features，后面将作为 image_features 喂给 LLM
+                fused_features.append(cur_feats)
+
 
                 if slot_module.last_div_loss is not None:
                     div_losses.append(slot_module.last_div_loss)
