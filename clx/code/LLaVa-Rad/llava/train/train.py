@@ -881,6 +881,44 @@ class LazySupervisedDataset(Dataset):
                 3, crop_size['height'], crop_size['width']
             )
 
+
+        # [2025-12-12] 新增 chexpert_labels，实现疾病级对齐
+        # ==== [CheXpert] 读取疾病标签 ====
+        CHEXPERT_LABEL_NAMES = [
+            "Atelectasis",
+            "Cardiomegaly",
+            "Consolidation",
+            "Edema",
+            "Enlarged Cardiomediastinum",
+            "Fracture",
+            "Lung Lesion",
+            "Lung Opacity",
+            "No Finding",
+            "Pleural Effusion",
+            "Pleural Other",
+            "Pneumonia",
+            "Pneumothorax",
+            "Support Devices",
+        ]
+
+        chexpert = sample.get("chexpert_labels", None)
+        if chexpert is not None:
+            y = []
+            m = []
+            for name in CHEXPERT_LABEL_NAMES:
+                val = chexpert.get(name, float("nan"))
+                # 判断 NaN
+                if val != val:  # NaN
+                    y.append(0.0)   # label 无效
+                    m.append(0.0)   # mask = 0
+                else:
+                    y.append(float(val > 0.0))
+                    m.append(1.0)
+            data_dict["disease_labels"] = torch.tensor(y, dtype=torch.float)
+            data_dict["disease_mask"] = torch.tensor(m, dtype=torch.float)
+
+        # [2025-12-12] 新增结束 chexpert_labels，实现疾病级对齐
+
         return data_dict
 
 
@@ -920,6 +958,16 @@ class DataCollatorForSupervisedDataset(object):
                 batch["view_ids"] = [ins["view_ids"] for ins in instances]
             if "orient_ids" in instances[0]:
                 batch["orient_ids"] = [ins["orient_ids"] for ins in instances]
+
+        # [2025-12-12] 新增 拼接其它键时加入疾病级标签
+        if "disease_labels" in instances[0]:
+            batch["disease_labels"] = torch.stack(
+                [inst["disease_labels"] for inst in instances], dim=0
+            )
+            batch["disease_mask"] = torch.stack(
+                [inst["disease_mask"] for inst in instances], dim=0
+            )
+        # [2025-12-12] 新增结束 拼接其它键时加入疾病级标签
 
         return batch
 

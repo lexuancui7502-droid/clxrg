@@ -65,7 +65,7 @@ class MultiSlotFusion(nn.Module):
     def __init__(
         self,
         dim: int,
-        num_slots: int = 4,
+        num_slots: int = 8,
         attn_dim: int = None,
         ffn_hidden_dim: int = None,
         num_view_types: int = 4,
@@ -399,54 +399,6 @@ class LlavaMetaForCausalLM(ABC):
             split_sizes = [img.shape[0] for img in image_list]
             per_sample = torch.split(all_feats, split_sizes, dim=0)   # tuple of (V_i, N_patch, D)
 
-            # 每个样本得到一个 (N_patch, D)，即融合好的多视角特征
-        #     image_features = [x.mean(dim=0) for x in per_sample]      # list[Tensor(N_patch, D)]
-        # else:
-            # 单视图路径：images 为 (B, 3, H, W)
-            # encode_images 返回 (B, N_patch, D)，第 0 维就是 batch 维
-        #     image_features = self.encode_images(images)
-
-            # [2025-12-7] 修改 开始
-            # # 3）对每个样本，进行黑盒 view-attention 融合
-            # model = self.get_model()
-            # view_attn = getattr(model, "view_attn", None)
-
-            # # [2025-11-30] 修改加权融合方法，用“残差插值”的方式融合：baseline + 小偏移
-            # fused_features = []
-            # for x in per_sample:
-            #     # x: (V, N_patch, D_lm)
-            #     V, Np, D = x.shape
-
-            #     # ① baseline：简单平均（完全在原有空间里）
-            #     baseline = x.mean(dim=0)   # (N_patch, D)
-
-            #     if view_attn is None:
-            #         fused = baseline
-            #         fused_features.append(fused)
-            #         continue
-
-            #     # ② view-attn 产生一组权重 β_v，得到“注意力融合”的结果
-            #     global_feats = x.mean(dim=1)         # (V, D)
-            #     scores = view_attn(global_feats)     # (V, 1)
-            #     weights = torch.softmax(scores, dim=0)
-            #     weights_ = weights.view(V, 1, 1)
-            #     attn_fused = (weights_ * x).sum(dim=0)    # (N_patch, D)
-
-            #     # ③ 残差插值：从 baseline 出发，只走一小步到 attn_fused
-            #     #    lambda 可以先手动设小一点，例如 0.3
-            #     lambda_ = float(os.environ.get("MV_LAMBDA", "0.05"))
-
-            #     fused = (1.0 - lambda_) * baseline + lambda_ * attn_fused
-
-            #     fused_features.append(fused)
-
-            # # 最终每个样本是 (N_patch, D_lm)
-            # # ✅ [2025-11-29] 暂时统一用简单平均做多视图融合（完全恢复你当初的 baseline）
-            # # fused_features = [x.mean(dim=0) for x in per_sample]      # list[Tensor(N_patch, D)]
-            # image_features = fused_features
-            # 3）对每个样本，做 multi-slot study-level 融合：
-            #    - 先把所有视图的 patch 展平成一个序列 X_all ∈ R^{(V·L)×D}
-            #    - 再用 M 个 latent 槽位做 cross-attention，得到 M 个 study-level token
             # [2025-12-8] 多-slot study-level 融合 + slot 正则
             model = self.get_model()
             slot_module = getattr(model, "slot_fusion", None)
@@ -485,6 +437,17 @@ class LlavaMetaForCausalLM(ABC):
                 if orient_ids_list[b] is not None:
                     o_ids = orient_ids_list[b][:V]
 
+                # ====== [2025-12-12 新增] 单视图特例：直接退回 baseline patch token ======
+                # 对 V == 1 的样本，不走 slot_fusion，也不记录 slot 正则
+                if V == 1:
+                    # x 形状是 (1, Np, D)，这里直接把唯一视图的 patch token 取出来
+                    cur_feats = x[0]          # (Np, D)
+                    fused_features.append(cur_feats)
+                    # 不追加 div_losses / cov_losses
+                    continue
+                # ====== [2025-12-12 新增结束] ======
+
+
                 # === [2025-12-11] 新增 1) 视图级 gating：SimpleViewAttention 显式建模视图重要性 ===
                 if (view_attn is not None) and (V > 1) and (mv_lambda > 0.0):
                     # 1.1 每个视图做 patch 平均，得到 (V, D) 的 global feature
@@ -507,7 +470,7 @@ class LlavaMetaForCausalLM(ABC):
                 # 直接把 (V, L, D) 交给 slot_fusion
                 # slots, _ = slot_module(x, view_ids=v_ids, orient_ids=o_ids)   # slots: (M, D_lm)
                 # fused_features.append(slots)
-                
+
                 # === [2025-12-11] 2) 多-slot 融合：slots + Top-K patch ===
                 # 2.1 交给 slot_fusion，得到 M 个 slot token 和注意力矩阵 attn
                 slots, attn = slot_module(x, view_ids=v_ids, orient_ids=o_ids)   # slots: (M, D_lm), attn: (M, V*Np)
@@ -545,6 +508,19 @@ class LlavaMetaForCausalLM(ABC):
 
             # 每个 study 有 M 个 slot token
             image_features = fused_features
+
+            # [2025-12-12] 新增 [CheXpert] study-level global feature，把每个 study 的视觉 token 平均成一个 (B, D) 的全局向量，并存到模型上，供后面计算疾病 loss 使用
+            if image_features is not None:
+                global_feats = []
+                for feat in image_features:
+                    # feat: (N_token, D)
+                    global_feats.append(feat.mean(dim=0))
+                global_feats = torch.stack(global_feats, dim=0)  # (B, D)
+                self._last_study_image_global = global_feats
+            else:
+                self._last_study_image_global = None
+            # [2025-12-12] 新增结束
+
 
             # 把 batch 内的 slot 正则平均一下，缓存到模型上，稍后在 forward 里加到 loss
             self._last_slot_div_loss = (

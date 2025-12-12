@@ -63,6 +63,12 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):                  # 组合视�
         num_view_types = getattr(config, "num_view_types", 4)
         num_orient_types = getattr(config, "num_orient_types", 3)
 
+        # [2025-12-12] 新增 疾病预测头
+        self.num_diseases = 14
+        self.disease_head = nn.Linear(config.hidden_size, self.num_diseases)
+        self.chexpert_lambda = float(os.environ.get("CHEXPERT_LAMBDA", "0.1"))
+        # [2025-12-12] 新增结束 疾病预测头
+
         self.slot_fusion = MultiSlotFusion(
             dim=dim,
             num_slots=num_slots,
@@ -120,6 +126,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         view_ids: Optional[List[torch.LongTensor]] = None,
         orient_ids: Optional[List[torch.LongTensor]] = None,
+        disease_labels: Optional[torch.FloatTensor] = None,   # ← [2025-12-12] 新增
+        disease_mask: Optional[torch.FloatTensor] = None,     # ← [2025-12-12] 新增
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:                  # 定义模型的前向传播逻辑，处理多模态输入（文本 + 图像）并生成预测结果
         # 参数默认值处理​，如果参数未显式传入，则使用模型配置中的默认值。
@@ -210,6 +218,40 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             if loss is None:
                 loss = 0.0
             loss = loss + self.study_contrast_weight * contrast_loss
+
+        # ====[2025-12-12] 新增 [CheXpert] 疾病多标签 BCE loss ====
+        import torch.nn.functional as F
+
+        chexpert_loss = None
+        model = self.get_model()
+
+        if (
+            disease_labels is not None
+            and getattr(model, "disease_head", None) is not None
+            and getattr(self, "_last_study_image_global", None) is not None
+        ):
+            # 注意：_last_study_image_global 你之前是挂在 self 上的，保持一致比较安全
+            global_feats = self._last_study_image_global.to(hidden_states.device)  # (B, D)
+            logits_cls = model.disease_head(global_feats)                           # (B, 14)
+
+            bce = F.binary_cross_entropy_with_logits(
+                logits_cls, disease_labels.to(logits_cls.device), reduction="none"
+            )  # (B,14)
+
+            if disease_mask is not None:
+                bce = bce * disease_mask.to(bce.device)
+                denom = disease_mask.sum()
+                chexpert_loss = bce.sum() / (denom + 1e-6)
+            else:
+                chexpert_loss = bce.mean()
+
+            lambda_c = getattr(model, "chexpert_lambda", 0.1)
+            if loss is None:
+                loss = lambda_c * chexpert_loss
+            else:
+                loss = loss + lambda_c * chexpert_loss
+        # ====[2025-12-12] 新增结束 [CheXpert] 疾病多标签 BCE loss ====
+
 
         # === slot 正则：多样性 + 视图覆盖 ===
         if getattr(self, "_last_slot_div_loss", None) is not None:
