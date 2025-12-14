@@ -78,6 +78,23 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):                  # 组合视�
             num_orient_types=num_orient_types,
         )
 
+        # ===[2025-12-13] 角色 embedding + gate（方案A）===
+        import math
+
+        # 0 = patch, 1 = slot
+        self.role_embed = nn.Embedding(2, dim)
+
+        # 希望初始时 alpha_patch ≈ 0.9, alpha_slot ≈ 0.1
+        patch_alpha0 = 0.85
+        slot_alpha0  = 0.15
+
+        self.patch_gate = nn.Parameter(
+            torch.tensor(math.log(patch_alpha0 / (1 - patch_alpha0)))
+        )
+        self.slot_gate = nn.Parameter(
+            torch.tensor(math.log(slot_alpha0 / (1 - slot_alpha0)))
+        )
+        # ===[2025-12-13] 角色 embedding + gate 结束 ===
     # [2025-12-8] 修改 结束
 
 # 语言生成模型，负责端到端的训练和推理。继承自 LlamaForCausalLM（纯文本生成模型）和 LlavaMetaForCausalLM（多模态支持）

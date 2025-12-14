@@ -65,7 +65,7 @@ class MultiSlotFusion(nn.Module):
     def __init__(
         self,
         dim: int,
-        num_slots: int = 8,
+        num_slots: int = 4,
         attn_dim: int = None,
         ffn_hidden_dim: int = None,
         num_view_types: int = 4,
@@ -399,7 +399,8 @@ class LlavaMetaForCausalLM(ABC):
             split_sizes = [img.shape[0] for img in image_list]
             per_sample = torch.split(all_feats, split_sizes, dim=0)   # tuple of (V_i, N_patch, D)
 
-            # [2025-12-8] 多-slot study-level 融合 + slot 正则
+            # [2025-12-13] 修改了多视图分支的逻辑
+            # [2025-12-8] 多-slot study-level 融合 + slot 正则（重写）
             model = self.get_model()
             slot_module = getattr(model, "slot_fusion", None)
             if slot_module is None:
@@ -407,16 +408,10 @@ class LlavaMetaForCausalLM(ABC):
                     "slot_fusion is not found on core model; "
                     "please make sure LlavaLlamaModel.__init__ initializes it."
                 )
-            
-            # === [2025-12-11] 新增：视图级注意力模块和超参数 ===
+
+            # 视图级注意力模块和超参数
             view_attn = getattr(model, "view_attn", None)
-
-            # MV_LAMBDA 控制视图 gating 的强度；默认 0 表示不启用
-            mv_lambda = float(os.environ.get("MV_LAMBDA", "0.0"))
-
-            # MV_TOPK_PATCH 控制 Top-K patch 的个数；默认 0 表示不启用
-            mv_topk = int(os.environ.get("MV_TOPK_PATCH", "0"))
-            # === [2025-12-11] 新增结束：视图级注意力模块和超参数 ===
+            mv_lambda = float(os.environ.get("MV_LAMBDA", "0.0"))   # 0 表示不启用
 
             fused_features = []
             div_losses = []
@@ -426,88 +421,110 @@ class LlavaMetaForCausalLM(ABC):
             view_ids_list = view_ids if view_ids is not None else [None] * len(per_sample)
             orient_ids_list = orient_ids if orient_ids is not None else [None] * len(per_sample)
 
+            # 约定：VIEW_VOCAB = {PA:0, AP:1, LATERAL:2, OTHER:3}
+            PA_ID, AP_ID, LAT_ID = 0, 1, 2
+
             for b, x in enumerate(per_sample):
                 # x: (V, N_patch, D_lm)
                 V, Np, D = x.shape
 
-                v_ids = None
-                o_ids = None
-                if view_ids_list[b] is not None:
-                    v_ids = view_ids_list[b][:V]  # [V]
-                if orient_ids_list[b] is not None:
-                    o_ids = orient_ids_list[b][:V]
+                v_ids = view_ids_list[b][:V] if view_ids_list[b] is not None else None
+                o_ids = orient_ids_list[b][:V] if orient_ids_list[b] is not None else None
 
-                # ====== [2025-12-12 新增] 单视图特例：直接退回 baseline patch token ======
-                # 对 V == 1 的样本，不走 slot_fusion，也不记录 slot 正则
-                if V == 1:
-                    # x 形状是 (1, Np, D)，这里直接把唯一视图的 patch token 取出来
-                    cur_feats = x[0]          # (Np, D)
-                    fused_features.append(cur_feats)
-                    # 不追加 div_losses / cov_losses
-                    continue
-                # ====== [2025-12-12 新增结束] ======
-
-
-                # === [2025-12-11] 新增 1) 视图级 gating：SimpleViewAttention 显式建模视图重要性 ===
+                # (1) 视图级 gating（可选）
                 if (view_attn is not None) and (V > 1) and (mv_lambda > 0.0):
-                    # 1.1 每个视图做 patch 平均，得到 (V, D) 的 global feature
-                    global_feats = x.mean(dim=1)                # (V, D)
-
-                    # 1.2 SimpleViewAttention 输出每个视图的 score，再 softmax 成权重
-                    scores = view_attn(global_feats)            # (V, 1)
-                    weights = torch.softmax(scores, dim=0)      # (V, 1)
-
-                    # 1.3 把 (V,1) reshape 成 (V,1,1)，用于缩放每个视图的所有 patch
-                    weights_ = weights.view(V, 1, 1)            # (V, 1, 1)
-
-                    # 1.4 残差式 gating：从原始特征出发，只“走一小步”到加权特征，避免一开始破坏预训练分布
-                    gated_x = weights_ * x                      # (V, Np, D)
+                    # 每个视图做 patch 平均，得到 (V, D) 的 global 特征
+                    global_feats = x.mean(dim=1)                 # (V, D)
+                    scores = view_attn(global_feats)             # (V, 1)
+                    weights = torch.softmax(scores, dim=0)       # (V, 1)
+                    weights_ = weights.view(V, 1, 1)             # (V, 1, 1)
+                    gated_x = weights_ * x                       # (V, Np, D)
                     x = (1.0 - mv_lambda) * x + mv_lambda * gated_x
-                    # 注意：这里直接重写 x，后面 slot_fusion 和 Top-K 都基于 gating 后的特征
-                    # === [2025-12-11] 新增结束
 
+                # (2) 对所有视图跑多-slot 融合，得到 M 个 slot token
+                slots, attn = slot_module(x, view_ids=v_ids, orient_ids=o_ids)   # slots: (M, D_lm)
 
-                # 直接把 (V, L, D) 交给 slot_fusion
-                # slots, _ = slot_module(x, view_ids=v_ids, orient_ids=o_ids)   # slots: (M, D_lm)
-                # fused_features.append(slots)
+                # (3) 选主视图
+                main_view_idx = 0
+                if V > 1:
+                    if v_ids is not None:
+                        # 优先 PA > AP > LATERAL > 其他
+                        for tgt in (PA_ID, AP_ID, LAT_ID):
+                            mask = (v_ids == tgt)
+                            if mask.any():
+                                main_view_idx = int(mask.nonzero(as_tuple=False)[0])
+                                break
+                        # 如果都没命中，就保持默认 0
+                    elif (view_attn is not None) and (mv_lambda > 0.0):
+                        # 没有显式 view_ids 时，用 gating 分数选一个视图
+                        with torch.no_grad():
+                            global_feats = x.mean(dim=1)          # (V, D)
+                            scores = view_attn(global_feats)      # (V, 1)
+                            main_view_idx = int(scores.squeeze(-1).argmax())
+                    # else: 留在 0（例如 V=1 时）
 
-                # === [2025-12-11] 2) 多-slot 融合：slots + Top-K patch ===
-                # 2.1 交给 slot_fusion，得到 M 个 slot token 和注意力矩阵 attn
-                slots, attn = slot_module(x, view_ids=v_ids, orient_ids=o_ids)   # slots: (M, D_lm), attn: (M, V*Np)
+                # (4) 主视图全 patch + slot 拼接前，加入角色 embedding 与组级 gate
+                main_patches = x[main_view_idx]  # (Np, D)
+                slots = slots  # (M, D)
+                
+                # --- Gate 缩放 ---
+                alpha_s = torch.sigmoid(model.slot_gate)
+                alpha_p = torch.sigmoid(model.patch_gate)
+                slots = alpha_s * slots
+                main_patches = alpha_p * main_patches
+                
+                # --- 拼接 ---
+                cur_feats = torch.cat([main_patches, slots], dim=0)  # (Np + M, D)
+                
+                # --- 角色 embedding ---
+                slot_roles = torch.ones(slots.size(0), dtype=torch.long, device=slots.device)
+                patch_roles = torch.zeros(main_patches.size(0), dtype=torch.long, device=main_patches.device)
+                role_ids = torch.cat([patch_roles, slot_roles], dim=0)
+                role_emb = model.role_embed(role_ids)
+                cur_feats = cur_feats + role_emb  # (Np + M, D)
+                
+                # (5) 如果在 LlavaLlamaModel.__init__ 里定义了角色 embedding，这里加上
+                patch_role_embed = getattr(model, "patch_role_embed", None)
+                slot_role_embed = getattr(model, "slot_role_embed", None)
+                if (patch_role_embed is not None) and (slot_role_embed is not None):
+                    num_slots = slots.size(0)
+                    num_tokens = cur_feats.size(0)
+                    num_patches = num_tokens - num_slots
+                    # 前半段是 patch，后半段是 slot
+                    cur_feats[:num_patches] = cur_feats[:num_patches] + patch_role_embed
+                    cur_feats[num_patches:] = cur_feats[num_patches:] + slot_role_embed
 
-                # 2.2 基于 slot 的注意力，在所有视图的 patch 上做全局 Top-K 选取
-                if mv_topk > 0:
-                    M, N_total = attn.shape               # N_total = V * Np
-                    K = min(mv_topk, N_total)             # 防止 K > patch 数
-
-                    # 2.2.1 为每个 patch 聚合一个 score，这里用 max over slots（你也可以换成 mean）
-                    patch_scores, _ = attn.max(dim=0)     # (N_total,)
-
-                    # 2.2.2 选出 score 最高的 K 个 patch 索引
-                    topk_scores, topk_idx = torch.topk(patch_scores, k=K, dim=-1)  # topk_idx: (K,)
-
-                    # 2.2.3 用同样的展平顺序从 x 中取出对应 patch 的特征
-                    x_flat = x.reshape(V * Np, D)         # (N_total, D)
-                    topk_tokens = x_flat[topk_idx]        # (K, D_lm)
-
-                    # 2.2.4 将 slots 和 Top-K patch token 在 token 维度拼接
-                    #       最终每个 study 的视觉 token 为 (M + K, D_lm)
-                    cur_feats = torch.cat([slots, topk_tokens], dim=0)
-                else:
-                    # 不启用 Top-K 时，保持原来的行为：只用 slots 作为视觉 token
-                    cur_feats = slots
-
-                # 2.3 加入 fused_features，后面将作为 image_features 喂给 LLM
                 fused_features.append(cur_feats)
 
-
+                # (6) 收集 slot 正则项
                 if slot_module.last_div_loss is not None:
                     div_losses.append(slot_module.last_div_loss)
                 if slot_module.last_cov_loss is not None:
                     cov_losses.append(slot_module.last_cov_loss)
 
-            # 每个 study 有 M 个 slot token
+            # 至此，每个 study 的视觉 token：
+            # - 单视图：Np 个该视图的 patch + M 个 slot
+            # - 多视图：主视图 Np 个 patch + M 个 slot
             image_features = fused_features
+
+            # 把 batch 内的 slot 正则平均一下，缓存到模型上
+            self._last_slot_div_loss = (
+                torch.stack(div_losses).mean() if len(div_losses) > 0 else None
+            )
+            self._last_slot_cov_loss = (
+                torch.stack(cov_losses).mean() if len(cov_losses) > 0 else None
+            )
+
+            # 为检查级对齐 / CheXpert 缓存 study-level 全局视觉向量
+            if len(image_features) > 0:
+                study_global = torch.stack(
+                    [feat.mean(dim=0) for feat in image_features], dim=0
+                )  # (B, D_lm)
+            else:
+                study_global = None
+            self._last_study_image_global = study_global
+            # [2025-12-13] 修改了多视图分支的逻辑 结束
+
 
             # [2025-12-12] 新增 [CheXpert] study-level global feature，把每个 study 的视觉 token 平均成一个 (B, D) 的全局向量，并存到模型上，供后面计算疾病 loss 使用
             if image_features is not None:
@@ -540,16 +557,16 @@ class LlavaMetaForCausalLM(ABC):
 
         # [2025-11-27] 新增：为检查级对齐缓存每个 study 的全局视觉向量
         # 此时 image_features 是长度为 B 的 list，每个元素形状 (N_patch, D_lm)
-        if len(image_features) > 0:
-            # 对 patch 维度做平均，得到 (B, D_lm) 的 study-level 表征
-            study_global = torch.stack(
-                [feat.mean(dim=0) for feat in image_features],
-                dim=0
-            )  # (B, D_lm)
-            # 直接挂在模型实例上，供 forward() 使用
-            self._last_study_image_global = study_global
-        else:
-            self._last_study_image_global = None
+        # if len(image_features) > 0:
+        #     # 对 patch 维度做平均，得到 (B, D_lm) 的 study-level 表征
+        #     study_global = torch.stack(
+        #         [feat.mean(dim=0) for feat in image_features],
+        #         dim=0
+        #     )  # (B, D_lm)
+        #     # 直接挂在模型实例上，供 forward() 使用
+        #     self._last_study_image_global = study_global
+        # else:
+        #     self._last_study_image_global = None
 
         # 准备存储新的输入嵌入和标签
         new_input_embeds = []
@@ -626,6 +643,10 @@ class LlavaMetaForCausalLM(ABC):
         if any(x.shape != new_input_embeds[0].shape for x in new_input_embeds):
             max_len = max(x.shape[0] for x in new_input_embeds)
 
+            # [2025-12-13] 新增 对齐 attention_mask 时知道每个样本“真实 new_len”
+            embed_lens = [x.shape[0] for x in new_input_embeds]  # 每个样本对齐前 new 序列长度
+            # [2025-12-13] 新增结束
+
             # 对输入嵌入进行填充对齐
             new_input_embeds_align = []
             for cur_new_embed in new_input_embeds:
@@ -642,16 +663,37 @@ class LlavaMetaForCausalLM(ABC):
                     new_labels_align.append(cur_new_label)
                 new_labels = torch.stack(new_labels_align, dim=0)
 
-            # 调整注意力掩码以匹配新的输入长度
+            # [2025-12-13] 修改 调整注意力掩码以匹配新的输入长度（兼容 labels=None 的推理/generate）
             if attention_mask is not None:
                 new_attention_mask = []
-                for cur_attention_mask, cur_new_labels, cur_new_labels_align in zip(attention_mask, _new_labels, new_labels):
-                    new_attn_mask_pad_left = torch.full((cur_new_labels.shape[0] - labels.shape[1],), True, dtype=attention_mask.dtype, device=attention_mask.device)
-                    new_attn_mask_pad_right = torch.full((cur_new_labels_align.shape[0] - cur_new_labels.shape[0],), False, dtype=attention_mask.dtype, device=attention_mask.device)
-                    cur_new_attention_mask = torch.cat((new_attn_mask_pad_left, cur_attention_mask, new_attn_mask_pad_right), dim=0)
+                for cur_attention_mask, new_len in zip(attention_mask, embed_lens):
+                    old_len = cur_attention_mask.shape[0]   # 原 attention_mask 长度（等于 input_ids padding 后长度）
+                    pad_left = new_len - old_len            # 新增的“左侧”有效 token 数（通常是插入的视觉 token）
+                    pad_right = max_len - new_len           # 为了对齐到 max_len 的“右侧”padding 数
+
+                    # 安全检查：理论上 new_len 不应小于 old_len
+                    if pad_left < 0:
+                        raise ValueError(f"pad_left < 0: new_len={new_len}, old_len={old_len}. Check multimodal concat logic.")
+
+                    new_attn_mask_pad_left = torch.full(
+                        (pad_left,), True, dtype=attention_mask.dtype, device=cur_attention_mask.device
+                    )
+                    new_attn_mask_pad_right = torch.full(
+                        (pad_right,), False, dtype=attention_mask.dtype, device=cur_attention_mask.device
+                    )
+                    cur_new_attention_mask = torch.cat(
+                        (new_attn_mask_pad_left, cur_attention_mask, new_attn_mask_pad_right), dim=0
+                    )
                     new_attention_mask.append(cur_new_attention_mask)
+
                 attention_mask = torch.stack(new_attention_mask, dim=0)
-                assert attention_mask.shape == new_labels.shape
+
+                # 断言：训练时对齐 labels；推理时对齐 new_input_embeds
+                if labels is not None:
+                    assert attention_mask.shape == new_labels.shape
+                else:
+                    assert attention_mask.shape == new_input_embeds.shape[:2]
+            # [2025-12-13] 修改结束
         else:               # 序列长度一致时的简单处理：如果所有样本长度相同，直接堆叠
             new_input_embeds = torch.stack(new_input_embeds, dim=0)
             if labels is not None:
@@ -660,7 +702,11 @@ class LlavaMetaForCausalLM(ABC):
             if attention_mask is not None:
                 new_attn_mask_pad_left = torch.full((attention_mask.shape[0], new_input_embeds.shape[1] - input_ids.shape[1]), True, dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat((new_attn_mask_pad_left, attention_mask), dim=1)
-                assert attention_mask.shape == new_input_embeds.shape[:2]
+                if labels is not None:
+                    assert attention_mask.shape == new_labels.shape
+                else:
+                    assert attention_mask.shape == new_input_embeds.shape[:2]
+
 
         return None, attention_mask, past_key_values, new_input_embeds, new_labels
 
