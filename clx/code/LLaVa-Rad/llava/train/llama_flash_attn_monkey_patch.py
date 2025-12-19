@@ -1,3 +1,4 @@
+# 正常版本：
 from typing import Optional, Tuple
 import warnings
 
@@ -128,3 +129,224 @@ def replace_llama_attn_with_flash_attn():
         _prepare_decoder_attention_mask
     )
     transformers.models.llama.modeling_llama.LlamaAttention.forward = forward
+
+
+# 猴子补丁版本：
+# llava/train/llama_flash_attn_monkey_patch.py
+
+# from typing import Optional, Tuple
+# import warnings
+
+# import torch
+# import transformers
+# from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
+
+# # FlashAttention entry
+# try:
+#     from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_func
+# except Exception:
+#     try:
+#         from flash_attn.flash_attn_interface import (
+#             flash_attn_varlen_qkvpacked_func as flash_attn_unpadded_qkvpacked_func,
+#         )
+#     except Exception:
+#         flash_attn_unpadded_qkvpacked_func = None
+
+# # Padding helpers (required)
+# try:
+#     from flash_attn.bert_padding import unpad_input, pad_input
+# except Exception as e:
+#     raise RuntimeError(
+#         "flash-attn is required for llama_flash_attn_monkey_patch, "
+#         "but failed to import flash_attn.bert_padding.{unpad_input,pad_input}."
+#     ) from e
+
+
+# def _unpad_out_parse(out):
+#     """Parse unpad_input outputs across flash-attn versions."""
+#     if isinstance(out, (tuple, list)):
+#         if len(out) < 4:
+#             raise RuntimeError(f"Unexpected unpad_input tuple/list length: {len(out)}")
+#         x_unpad, indices, cu_lens, max_s = out[:4]
+#         return x_unpad, indices, cu_lens, max_s
+
+#     if isinstance(out, dict):
+#         x_unpad = out.get("x_unpad") or out.get("qkv") or out.get("unpadded")
+#         indices = out.get("indices")
+#         cu_lens = out.get("cu_seqlens") or out.get("cu_q_lens") or out.get("cu_lens")
+#         max_s = out.get("max_seqlen") or out.get("max_s")
+#         if x_unpad is None or indices is None or cu_lens is None or max_s is None:
+#             raise RuntimeError(f"Unexpected unpad_input dict keys: {list(out.keys())}")
+#         return x_unpad, indices, cu_lens, max_s
+
+#     raise RuntimeError(f"Unexpected unpad_input return type: {type(out)}")
+
+
+# def _normalize_key_padding_mask(
+#     attention_mask: Optional[torch.Tensor],
+#     bsz: int,
+#     q_len: int,
+#     device: torch.device,
+# ) -> Optional[torch.Tensor]:
+#     """
+#     Convert attention_mask to key_padding_mask in shape [bsz, q_len], dtype=bool,
+#     where True indicates VALID tokens (keep), False indicates padding.
+#     """
+#     if attention_mask is None:
+#         return None
+
+#     m = attention_mask
+
+#     # Common cases:
+#     # 1) [bsz, seq]
+#     # 2) [bsz, 1, 1, seq]
+#     # 3) [bsz, 1, q, k]  (we take the first query row as padding mask)
+#     if m.dim() == 4:
+#         if m.size(1) == 1 and m.size(2) == 1:
+#             m = m[:, 0, 0, :]  # [bsz, seq]
+#         elif m.size(1) == 1:
+#             # [bsz, 1, q, k] -> take q=0 row -> [bsz, k]
+#             m = m[:, 0, 0, :]
+#         else:
+#             # Unexpected 4D layout; attempt a conservative squeeze
+#             m = m.reshape(bsz, -1)
+
+#     if m.dim() != 2:
+#         raise RuntimeError(f"Unsupported attention_mask dim={m.dim()}, shape={tuple(m.shape)}")
+
+#     # Ensure length matches q_len
+#     if m.size(0) != bsz:
+#         raise RuntimeError(f"attention_mask batch mismatch: {m.size(0)} vs bsz={bsz}")
+#     if m.size(1) != q_len:
+#         # For safety, refuse silent mismatch (this is where many subtle bugs come from)
+#         raise RuntimeError(f"attention_mask seq mismatch: {m.size(1)} vs q_len={q_len}")
+
+#     # Convert to bool:
+#     # - If it's float and looks like additive mask (0 / -inf), treat > -1e4 as valid.
+#     # - Else treat nonzero as valid.
+#     if m.dtype.is_floating_point:
+#         # additive mask often has 0 for keep and -inf (or very negative) for masked
+#         if torch.isfinite(m).all() and (m.min() < 0):
+#             m_bool = m > -1.0e4
+#         else:
+#             # standard attention_mask float(0/1)
+#             m_bool = m > 0.5
+#     else:
+#         m_bool = m != 0
+
+#     return m_bool.to(device=device, dtype=torch.bool)
+
+
+# def forward(
+#     self,
+#     hidden_states: torch.Tensor,
+#     attention_mask: Optional[torch.Tensor] = None,
+#     position_ids: Optional[torch.Tensor] = None,
+#     past_key_value: Optional[Tuple[torch.Tensor]] = None,
+#     output_attentions: bool = False,
+#     use_cache: bool = False,
+# ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
+#     if flash_attn_unpadded_qkvpacked_func is None:
+#         raise RuntimeError("flash_attn_unpadded_qkvpacked_func is None. flash-attn not properly installed.")
+
+#     if output_attentions:
+#         warnings.warn(
+#             "Output attentions is not supported for patched `LlamaAttention`, returning `None` instead."
+#         )
+
+#     bsz, q_len, _ = hidden_states.size()
+
+#     # Normalize key padding mask ONCE, early.
+#     key_padding_mask = _normalize_key_padding_mask(attention_mask, bsz, q_len, hidden_states.device)
+
+#     # Project to Q/K/V
+#     query_states = (
+#         self.q_proj(hidden_states)
+#         .view(bsz, q_len, self.num_heads, self.head_dim)
+#         .transpose(1, 2)
+#     )
+#     key_states = (
+#         self.k_proj(hidden_states)
+#         .view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+#         .transpose(1, 2)
+#     )
+#     value_states = (
+#         self.v_proj(hidden_states)
+#         .view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+#         .transpose(1, 2)
+#     )
+
+#     # KV sequence length with cache
+#     kv_seq_len = key_states.shape[-2]
+#     if past_key_value is not None:
+#         kv_seq_len += past_key_value[0].shape[-2]
+
+#     # RoPE
+#     cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+#     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+#     # Cache concat
+#     if past_key_value is not None:
+#         key_states = torch.cat([past_key_value[0], key_states], dim=2)
+#         value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+#     past_key_value = (key_states, value_states) if use_cache else None
+
+#     # GQA
+#     key_states = repeat_kv(key_states, self.num_key_value_groups)
+#     value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+#     # Pack qkv: [bsz, seq, 3, nheads, headdim]
+#     qkv = torch.stack([query_states, key_states, value_states], dim=2)  # [b, h, 3, s, d]
+#     qkv = qkv.transpose(1, 3).contiguous()  # [b, s, 3, h, d]
+
+#     # Dropout: keep correct behavior in training
+#     dropout_p = float(getattr(self, "attention_dropout", 0.0)) if self.training else 0.0
+
+#     if key_padding_mask is None:
+#         # No padding: dense path
+#         qkv = qkv.view(-1, 3, self.num_heads, self.head_dim)  # [b*s, 3, h, d]
+#         cu_q_lens = torch.arange(
+#             0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=qkv.device
+#         )
+#         max_s = q_len
+#         out = flash_attn_unpadded_qkvpacked_func(
+#             qkv, cu_q_lens, max_s, dropout_p, softmax_scale=None, causal=True
+#         )
+#         out = out.view(bsz, q_len, -1)
+#     else:
+#         # With padding: unpad -> flashattn -> pad back
+#         qkv_2d = qkv.view(bsz, q_len, -1)  # [b, s, 3*h*d]
+#         unpad_ret = unpad_input(qkv_2d, key_padding_mask)
+#         qkv_unpad, indices, cu_q_lens, max_s = _unpad_out_parse(unpad_ret)
+
+#         cu_q_lens = cu_q_lens.to(device=qkv_unpad.device, dtype=torch.int32)
+#         qkv_unpad = qkv_unpad.view(-1, 3, self.num_heads, self.head_dim)
+
+#         out_unpad = flash_attn_unpadded_qkvpacked_func(
+#             qkv_unpad, cu_q_lens, max_s, dropout_p, softmax_scale=None, causal=True
+#         )
+#         out_unpad = out_unpad.reshape(-1, self.num_heads * self.head_dim)
+#         out = pad_input(out_unpad, indices, bsz, q_len)
+
+#     return self.o_proj(out), None, past_key_value
+
+
+# def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+#     # Return the original (2D) attention mask, because flash-attn unpad_input expects [bsz, seq]
+#     return attention_mask
+
+
+# def replace_llama_attn_with_flash_attn():
+#     cuda_major, _ = torch.cuda.get_device_capability()
+#     if cuda_major < 8:
+#         warnings.warn(
+#             "FlashAttention training is typically supported on Ampere (SM80) or newer. "
+#             "If you hit backward errors, disable flash-attn patch."
+#         )
+
+#     transformers.models.llama.modeling_llama.LlamaModel._prepare_decoder_attention_mask = (
+#         _prepare_decoder_attention_mask
+#     )
+#     transformers.models.llama.modeling_llama.LlamaAttention.forward = forward

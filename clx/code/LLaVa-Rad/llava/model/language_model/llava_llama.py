@@ -31,7 +31,7 @@ from ..llava_arch import (
     LlavaMetaModel,
     LlavaMetaForCausalLM,
     SimpleViewAttention,
-    MultiSlotFusion,     # <<< 新增
+    ARCVIFusion,          # [2025-12-14] 新增
 )
 
 
@@ -42,60 +42,44 @@ class LlavaConfig(LlamaConfig):                 # 继承LLaMA配置，定义LLaV
 class LlavaLlamaModel(LlavaMetaModel, LlamaModel):                  # 组合视觉和语言能力，继承自LLaMA模型。LlamaModel: 提供文本理解能力；LlavaMetaModel: 提供多模态融合能力
     config_class = LlavaConfig
 
-    # [2025-12-8] 修改 开始：修改整个init函数
-    # def __init__(self, config: LlamaConfig):
-    #     super(LlavaLlamaModel, self).__init__(config)
-    #     # [2025-11-19] 这里的 dim 要和 encode_images 输出的 D 一致，等于 LLM 的 hidden_size
-    #     self.view_attn = SimpleViewAttention(dim=config.hidden_size)
+    # [2025-12-14] 修改 LlavaLlamaModel.__init__：移除 slot+gate，改为初始化 AR-CVI 开始
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
-
-        # 这里的 dim 要和 encode_images 输出的 D 一致，等于 LLM 的 hidden_size
         dim = config.hidden_size
 
-        # 视图级加权模块（保留，以后你想关掉也可以）
+        # 可保留（如果你还想做 view-level 的轻量加权/对齐）
         self.view_attn = SimpleViewAttention(dim=dim)
 
-        # 多-slot study-level 融合模块
-        num_slots = getattr(config, "num_slots", 4)
-        attn_dim = getattr(config, "slot_attn_dim", None)
-        ffn_hidden_dim = getattr(config, "slot_ffn_hidden_dim", None)
-        num_view_types = getattr(config, "num_view_types", 4)
-        num_orient_types = getattr(config, "num_orient_types", 3)
-
-        # [2025-12-12] 新增 疾病预测头
+        # [2025-12-12] 疾病预测头保持不变
         self.num_diseases = 14
         self.disease_head = nn.Linear(config.hidden_size, self.num_diseases)
         self.chexpert_lambda = float(os.environ.get("CHEXPERT_LAMBDA", "0.1"))
-        # [2025-12-12] 新增结束 疾病预测头
 
-        self.slot_fusion = MultiSlotFusion(
+        # === AR-CVI 配置（都有默认值，保证可跑）===
+        self.mv_fusion = os.environ.get("MV_FUSION", "ar_cvi")
+
+        evidence_tokens = int(os.environ.get("AR_CVI_EVID", str(getattr(config, "ar_cvi_evid", 16))))
+        memory_tokens   = int(os.environ.get("AR_CVI_MEM",  str(getattr(config, "ar_cvi_mem", 32))))
+        cvi_layers      = int(os.environ.get("AR_CVI_LAYERS", str(getattr(config, "ar_cvi_layers", 2))))
+        attn_dim        = int(os.environ.get("AR_CVI_ATTN_DIM", str(getattr(config, "ar_cvi_attn_dim", 1024))))
+        aux_r           = int(os.environ.get("AR_CVI_AUX_R", str(getattr(config, "ar_cvi_aux_r", 24))))
+
+        num_view_types  = getattr(config, "num_view_types", 4)
+        num_orient_types= getattr(config, "num_orient_types", 3)
+
+        self.ar_cvi = ARCVIFusion(
             dim=dim,
-            num_slots=num_slots,
+            evidence_tokens=evidence_tokens,
+            memory_tokens=memory_tokens,
+            cvi_layers=cvi_layers,
             attn_dim=attn_dim,
-            ffn_hidden_dim=ffn_hidden_dim,
+            num_heads=8,
+            aux_downsample_r=aux_r,
+            dropout=0.0,
             num_view_types=num_view_types,
             num_orient_types=num_orient_types,
         )
-
-        # ===[2025-12-13] 角色 embedding + gate（方案A）===
-        import math
-
-        # 0 = patch, 1 = slot
-        self.role_embed = nn.Embedding(2, dim)
-
-        # 希望初始时 alpha_patch ≈ 0.9, alpha_slot ≈ 0.1
-        patch_alpha0 = 0.85
-        slot_alpha0  = 0.15
-
-        self.patch_gate = nn.Parameter(
-            torch.tensor(math.log(patch_alpha0 / (1 - patch_alpha0)))
-        )
-        self.slot_gate = nn.Parameter(
-            torch.tensor(math.log(slot_alpha0 / (1 - slot_alpha0)))
-        )
-        # ===[2025-12-13] 角色 embedding + gate 结束 ===
-    # [2025-12-8] 修改 结束
+    # [2025-12-14] 修改 LlavaLlamaModel.__init__：移除 slot+gate，改为初始化 AR-CVI 结束
 
 # 语言生成模型，负责端到端的训练和推理。继承自 LlamaForCausalLM（纯文本生成模型）和 LlavaMetaForCausalLM（多模态支持）
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):

@@ -231,6 +231,338 @@ class MultiSlotFusion(nn.Module):
         self.last_cov_loss = ((p - uniform) ** 2).mean()        
 
 
+# [2025-12-14] 新增 AR-CVI 模块（证据token + 共享memory交互 + 锚点路由 + 门控融合）开始
+import torch.nn.functional as F
+
+def _downsample_grid_tokens(x: torch.Tensor, r: int) -> torch.Tensor:
+    """
+    x: (N, D) where N = H*W (e.g., 37*37)
+    return: (r*r, D) adaptive average pooled on the token grid
+    """
+    N, D = x.shape
+    H = int(math.sqrt(N))
+    if H * H != N or r <= 0 or r >= H:
+        return x
+    x2d = x.transpose(0, 1).reshape(D, H, H).unsqueeze(0)   # (1, D, H, W)
+    x2d = F.adaptive_avg_pool2d(x2d, (r, r))                # (1, D, r, r)
+    xds = x2d.squeeze(0).reshape(D, r * r).transpose(0, 1)  # (r*r, D)
+    return xds
+
+class _CrossAttnLite(nn.Module):
+    """
+    Low-rank cross-attention: Q in dim -> attn_dim, K/V in dim -> attn_dim, then project back.
+    Uses scaled_dot_product_attention when available (PyTorch>=2).
+    """
+    def __init__(self, dim: int, attn_dim: int = 1024, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        assert attn_dim % num_heads == 0
+        self.dim = dim
+        self.attn_dim = attn_dim
+        self.num_heads = num_heads
+        self.head_dim = attn_dim // num_heads
+        self.dropout = dropout
+
+        self.q_proj = nn.Linear(dim, attn_dim, bias=False)
+        self.k_proj = nn.Linear(dim, attn_dim, bias=False)
+        self.v_proj = nn.Linear(dim, attn_dim, bias=False)
+        self.o_proj = nn.Linear(attn_dim, dim, bias=False)
+
+    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        """
+        q:  (B, Lq, D)
+        kv: (B, Lk, D)
+        return: (B, Lq, D)
+        """
+        B, Lq, _ = q.shape
+        _, Lk, _ = kv.shape
+
+        qh = self.q_proj(q).view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)   # (B, H, Lq, Hd)
+        kh = self.k_proj(kv).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, Lk, Hd)
+        vh = self.v_proj(kv).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, Lk, Hd)
+
+        if hasattr(F, "scaled_dot_product_attention"):
+            out = F.scaled_dot_product_attention(
+                qh, kh, vh,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False
+            )  # (B, H, Lq, Hd)
+        else:
+            attn = (qh @ kh.transpose(-2, -1)) / math.sqrt(self.head_dim)   # (B,H,Lq,Lk)
+            attn = attn.softmax(dim=-1)
+            if self.training and self.dropout > 0:
+                attn = F.dropout(attn, p=self.dropout)
+            out = attn @ vh  # (B,H,Lq,Hd)
+
+        out = out.transpose(1, 2).contiguous().view(B, Lq, self.attn_dim)   # (B,Lq,attn_dim)
+        out = self.o_proj(out)                                              # (B,Lq,D)
+        return out
+
+class TokenLearnerLite(nn.Module):
+    """
+    从 (N,D) patch tokens 自适应聚合出 K 个 evidence tokens。
+    参考 TokenLearner 思想，但做成最轻量的“注意力加权求和”版本。
+    """
+    def __init__(self, dim: int, num_tokens: int = 16):
+        super().__init__()
+        self.num_tokens = num_tokens
+        self.norm = nn.LayerNorm(dim)
+        self.score = nn.Linear(dim, num_tokens, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (N,D)
+        return: (K,D)
+        """
+        xn = self.norm(x)
+        logits = self.score(xn)                  # (N,K)
+        attn = torch.softmax(logits.transpose(0, 1), dim=-1)  # (K,N)
+        tok = attn @ x                           # (K,D)
+        return tok
+
+class SharedMemoryCVI(nn.Module):
+    """
+    共享 memory tokens 作为跨视角信息交换通道（Flamingo/Perceiver-resampler 的“latent通道”思想）。
+    这里不替代 patch，只用于 evidence tokens 之间的信息交换。
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_memory: int = 32,
+        num_layers: int = 2,
+        attn_dim: int = 1024,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+        ffn_mult: int = 2,  # 保留参数以兼容旧调用，但在 bottleneck 模式下不再使用
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.mem = nn.Parameter(torch.randn(1, num_memory, dim) * 0.02)
+
+        self.mem_ln1 = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
+        self.mem_attn = nn.ModuleList([_CrossAttnLite(dim, attn_dim, num_heads, dropout) for _ in range(num_layers)])
+        self.mem_ln2 = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
+
+        self.evi_ln1 = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
+        self.evi_attn = nn.ModuleList([_CrossAttnLite(dim, attn_dim, num_heads, dropout) for _ in range(num_layers)])
+        self.evi_ln2 = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
+
+        # [2025-12-14] 修改 SharedMemoryCVI：将大FFN(dim->ffn_mult*dim->dim)替换为bottleneck(dim->ffn_hidden->dim)开始
+        # 说明：
+        # - 不改变 token 数、不改变 cross-attn 逻辑，只减少 FFN 参数量，显著降低 AdamW optimizer state 显存开销。
+        # - ffn_hidden 默认 1024；你可以通过环境变量 AR_CVI_FFN_HIDDEN 调整 (512/1024/2048)。
+        import os
+        ffn_hidden = int(os.environ.get("AR_CVI_FFN_HIDDEN", "1024"))
+
+        def make_bottleneck_ffn():
+            ffn = nn.Sequential(
+                nn.Linear(dim, ffn_hidden),
+                nn.GELU(),
+                nn.Linear(ffn_hidden, dim),
+            )
+            # 让 FFN 初始更接近“恒等映射”，降低训练初期扰动/退化风险
+            nn.init.zeros_(ffn[-1].weight)
+            nn.init.zeros_(ffn[-1].bias)
+            return ffn
+
+        self.mem_ffn = nn.ModuleList([make_bottleneck_ffn() for _ in range(num_layers)])
+        self.evi_ffn = nn.ModuleList([make_bottleneck_ffn() for _ in range(num_layers)])
+        # [2025-12-14] 修改 SharedMemoryCVI：将大FFN(dim->ffn_mult*dim->dim)替换为bottleneck(dim->ffn_hidden->dim)结束
+
+
+    def forward(self, evidence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        evidence: (V,K,D)
+        return:
+          evidence_new: (V,K,D)
+          mem_new: (M,D)
+        """
+        V, K, D = evidence.shape
+        E = evidence.reshape(1, V * K, D)              # (1, VK, D)
+        M = self.mem.expand(1, -1, -1)                 # (1, M, D)
+
+        for i in range(self.num_layers):
+            # (A) memory update: M attends to all evidence (跨视角汇聚)
+            M = M + self.mem_attn[i](self.mem_ln1[i](M), self.evi_ln1[i](E))
+            M = M + self.mem_ffn[i](self.mem_ln2[i](M))
+
+            # (B) evidence update: evidence attends to memory (跨视角广播)
+            E = E + self.evi_attn[i](self.evi_ln1[i](E), self.mem_ln1[i](M))
+            E = E + self.evi_ffn[i](self.evi_ln2[i](E))
+
+        return E.view(V, K, D), M.squeeze(0)
+
+class MemoryConditionedAnchorRouter(nn.Module):
+    """
+    用 memory-conditioned 的方式给每个视角打分，选择“主视角锚点”。
+    关键：打分网络最后一层初始化为 0，使训练初期不扰动；再叠加可学习的 view/orient bias 作“先验暖启动”。
+    """
+    def __init__(self, dim: int, num_view_types: int = 4, num_orient_types: int = 3):
+        super().__init__()
+        self.dim = dim
+        self.q_proj = nn.Linear(dim, dim // 4, bias=False)
+        self.k_proj = nn.Linear(dim, dim // 4, bias=False)
+
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim // 4),
+            nn.GELU(),
+            nn.Linear(dim // 4, 1),
+        )
+        # 训练初期 scores≈0，避免随机扰动导致锚点乱选
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+        # 可学习的 metadata bias（不是硬规则，参数可被学习推翻）
+        self.view_bias = nn.Embedding(num_view_types + 1, 1)    # +PAD
+        self.orient_bias = nn.Embedding(num_orient_types + 1, 1)
+
+        # 暖启动：PA/AP/LAT 更可能是“主视角”，但这是可学习参数（非硬编码）
+        with torch.no_grad():
+            # 假设 VIEW: PA=0, AP=1, LAT=2, OTHER=3, PAD=4
+            self.view_bias.weight.zero_()
+            if num_view_types >= 3:
+                self.view_bias.weight[0] = 0.5  # PA
+                self.view_bias.weight[1] = 0.2  # AP
+                self.view_bias.weight[2] = 0.1  # LAT
+            # orient bias 默认 0
+            self.orient_bias.weight.zero_()
+
+    def forward(
+        self,
+        evidence: torch.Tensor,   # (V,K,D)
+        mem: torch.Tensor,        # (M,D)
+        view_ids: torch.Tensor | None = None,
+        orient_ids: torch.Tensor | None = None,
+        hard: bool = True,
+        tau: float = 1.0,
+    ):
+        V, K, D = evidence.shape
+        mem_q = mem.mean(dim=0)                       # (D,)
+
+        q = self.q_proj(mem_q)                        # (d,)
+        scores = []
+        for v in range(V):
+            Ev = evidence[v]                          # (K,D)
+            k = self.k_proj(Ev)                       # (K,d)
+            attn = (k @ q) / math.sqrt(k.size(-1))    # (K,)
+            attn = attn.softmax(dim=0)
+            gv = (attn.unsqueeze(-1) * Ev).sum(dim=0) # (D,)
+            sv = self.mlp(gv).squeeze(-1)             # scalar
+
+            if view_ids is not None and v < view_ids.numel():
+                sv = sv + self.view_bias(view_ids[v]).squeeze(-1)
+            if orient_ids is not None and v < orient_ids.numel():
+                sv = sv + self.orient_bias(orient_ids[v]).squeeze(-1)
+
+            scores.append(sv)
+
+        scores = torch.stack(scores, dim=0)           # (V,)
+        probs = torch.softmax(scores / max(tau, 1e-6), dim=0)
+
+        if hard and V > 1:
+            onehot = F.gumbel_softmax(scores, tau=max(tau, 1e-6), hard=True)
+            anchor_idx = int(onehot.argmax().item())
+        else:
+            anchor_idx = int(probs.argmax().item())
+
+        entropy = -(probs * (probs + 1e-8).log()).sum()
+        return anchor_idx, probs, entropy, scores
+
+class GatedAnchorFuser(nn.Module):
+    """
+    用 Cross-Attn 将“辅助证据 tokens + memory tokens”注入到“主视角全 patch tokens”里。
+    门控 gate 初始≈0：训练初期等价于只用主视角（不退化保护）。
+    """
+    def __init__(self, dim: int, attn_dim: int = 1024, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.ln = nn.LayerNorm(dim)
+        self.attn = _CrossAttnLite(dim, attn_dim, num_heads, dropout)
+        # gate 初始很小 => 先当作 baseline，再逐步学会用辅助视角
+        self.gate = nn.Parameter(torch.tensor(-6.0))
+
+    def forward(self, anchor_patches: torch.Tensor, aux_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        anchor_patches: (Np,D)
+        aux_tokens:     (S,D)
+        return:         (Np,D)
+        """
+        B = 1
+        q = self.ln(anchor_patches).unsqueeze(0)   # (1,Np,D)
+        kv = aux_tokens.unsqueeze(0)               # (1,S,D)
+        delta = self.attn(q, kv).squeeze(0)        # (Np,D)
+        g = torch.sigmoid(self.gate)               # scalar ~0 at init
+        return anchor_patches + g * delta
+
+class ARCVIFusion(nn.Module):
+    """
+    输入：x (V,Np,D)
+    输出：fused (Np,D) —— 只把“融合后的主视角全patch”喂给 LLM（长度≈baseline）
+    """
+    def __init__(
+        self,
+        dim: int,
+        evidence_tokens: int = 16,
+        memory_tokens: int = 32,
+        cvi_layers: int = 2,
+        attn_dim: int = 1024,
+        num_heads: int = 8,
+        aux_downsample_r: int = 24,
+        dropout: float = 0.0,
+        num_view_types: int = 4,
+        num_orient_types: int = 3,
+    ):
+        super().__init__()
+        self.aux_downsample_r = aux_downsample_r
+        self.token_learner = TokenLearnerLite(dim, evidence_tokens)
+        self.cvi = SharedMemoryCVI(dim, memory_tokens, cvi_layers, attn_dim, num_heads, dropout)
+        self.router = MemoryConditionedAnchorRouter(dim, num_view_types=num_view_types, num_orient_types=num_orient_types)
+        self.fuser = GatedAnchorFuser(dim, attn_dim, num_heads, dropout)
+
+        # router 温度与是否 hard 选择（可通过环境变量调）
+        self.router_tau = float(os.environ.get("AR_CVI_TAU", "1.0"))
+        self.router_hard = (os.environ.get("AR_CVI_HARD", "1") == "1")
+
+    def forward(self, x: torch.Tensor, view_ids=None, orient_ids=None):
+        """
+        x: (V,Np,D)
+        view_ids/orient_ids: (V,)
+        """
+        V, Np, D = x.shape
+        if V <= 1:
+            fused = x[0]
+            info = {"anchor_idx": 0, "entropy": fused.new_zeros(()), "probs": fused.new_ones((1,))}
+            return fused, info
+
+        evid = []
+        for v in range(V):
+            xv = x[v]                                     # (Np,D)
+            xv_ds = _downsample_grid_tokens(xv, self.aux_downsample_r)
+            ev = self.token_learner(xv_ds)                # (K,D)
+            evid.append(ev)
+        evid = torch.stack(evid, dim=0)                   # (V,K,D)
+
+        evid, mem = self.cvi(evid)                        # cross-view interaction
+
+        if view_ids is not None:
+            view_ids = view_ids.to(x.device)
+        if orient_ids is not None:
+            orient_ids = orient_ids.to(x.device)
+
+        anchor_idx, probs, entropy, scores = self.router(
+            evid, mem, view_ids=view_ids, orient_ids=orient_ids,
+            hard=self.router_hard, tau=self.router_tau
+        )
+
+        aux_list = [evid[i] for i in range(V) if i != anchor_idx]
+        aux_tokens = torch.cat(aux_list + [mem], dim=0)   # ( (V-1)*K + M, D )
+
+        fused = self.fuser(x[anchor_idx], aux_tokens)     # (Np,D)
+
+        info = {"anchor_idx": anchor_idx, "entropy": entropy, "probs": probs, "scores": scores}
+        return fused, info
+# [2025-12-14] 新增 AR-CVI 模块（证据token + 共享memory交互 + 锚点路由 + 门控融合）结束
+
+
 # 这个类定义了多模态基础模型，结合视觉编码器和语言模型
 class LlavaMetaModel:
 
@@ -328,8 +660,23 @@ class LlavaMetaForCausalLM(ABC):
             vt_dtype = vt_params[0].dtype
             images = images.to(device=vt_device, dtype=vt_dtype)
 
+        # [2025-12-14] 修改 encode_images：冻结 vision_tower 时用 no_grad 降显存 开始
+        import contextlib
+
         # 2. 先过视觉塔，拿到 patch 特征
-        image_features = vision_tower(images)   # (B_or_sumV, N_patch, D_vt)
+        vt_frozen = True
+        for p in vision_tower.parameters():
+            if p.requires_grad:
+                vt_frozen = False
+                break
+            
+        if vt_frozen:
+            with torch.no_grad():
+                image_features = vision_tower(images)   # (B_or_sumV, N_patch, D_vt)
+        else:
+            image_features = vision_tower(images)
+        # [2025-12-14] 修改 encode_images：冻结 vision_tower 时用 no_grad 降显存 结束
+
 
         # 3. 再把特征 cast 到 projector 的 dtype 上
         proj_params = list(projector.parameters())
@@ -361,6 +708,7 @@ class LlavaMetaForCausalLM(ABC):
         self._last_study_image_global = None
         self._last_slot_div_loss = None
         self._last_slot_cov_loss = None
+        self._last_router_entropy = None
 
         # 输入验证和处理
         if vision_tower is None or images is None or input_ids.shape[1] == 1:           # 如果没有视觉编码器或图像，或输入仅包含单个token，则不进行多模态处理
@@ -380,179 +728,133 @@ class LlavaMetaForCausalLM(ABC):
         #     # 处理单个图像批次
         #     image_features = self.encode_images(images)
 
-        # [2025-11-18] 图像特征提取和分块
-        #   - eval 阶段：images 是 list[Tensor]，每个 Tensor 形状 (N_view, 3, H, W)
-        #   - 以后 train 阶段：也可以是 (B, N_view, 3, H, W) 的 5D Tensor
         if isinstance(images, list) or (isinstance(images, torch.Tensor) and images.ndim == 5):
             # 统一成 list[Tensor(N_view, 3, H, W)]
             if isinstance(images, torch.Tensor):
-                image_list = [img for img in images]          # (B, N_view, 3, H, W) -> list 长度 B
+                image_list = [img for img in images]   # (B, V, 3, H, W) -> list[B]
             else:
-                image_list = images                           # 本身就是 list
+                image_list = images                    # list[B] of (V,3,H,W)
 
-            # 1）先把所有视图摊平成一个大 batch，送进视觉塔
-            #    sum_V = 所有 sample 的视图总数
-            concat_images = torch.cat(image_list, dim=0)      # (sum_V, 3, H, W)
-            all_feats = self.encode_images(concat_images)     # (sum_V, N_patch, D)
-
-            # 2）按每个样本的视图数切回来，并在视图维度上做平均 -> study-level 表征
-            split_sizes = [img.shape[0] for img in image_list]
-            per_sample = torch.split(all_feats, split_sizes, dim=0)   # tuple of (V_i, N_patch, D)
-
-            # [2025-12-13] 修改了多视图分支的逻辑
-            # [2025-12-8] 多-slot study-level 融合 + slot 正则（重写）
             model = self.get_model()
-            slot_module = getattr(model, "slot_fusion", None)
-            if slot_module is None:
-                raise RuntimeError(
-                    "slot_fusion is not found on core model; "
-                    "please make sure LlavaLlamaModel.__init__ initializes it."
-                )
+            mv_fusion = os.environ.get("MV_FUSION", getattr(model, "mv_fusion", "ar_cvi")).lower()
 
-            # 视图级注意力模块和超参数
-            view_attn = getattr(model, "view_attn", None)
-            mv_lambda = float(os.environ.get("MV_LAMBDA", "0.0"))   # 0 表示不启用
+            # =========================================================
+            # [STRICT BASELINE] 先选定每个 study 的一张图，再走单视角 encode
+            # =========================================================
+            if mv_fusion == "baseline":
+                pick = os.environ.get("MV_BASELINE_PICK", "INDEX")  # 建议默认 INDEX
+                baseline_index = int(os.environ.get("MV_BASELINE_INDEX", "0"))
 
-            fused_features = []
-            div_losses = []
-            cov_losses = []
+                picked = []
+                view_ids_list = view_ids if view_ids is not None else [None] * len(image_list)
 
-            # view_ids / orient_ids: list[Tensor] or None
-            view_ids_list = view_ids if view_ids is not None else [None] * len(per_sample)
-            orient_ids_list = orient_ids if orient_ids is not None else [None] * len(per_sample)
+                for b, img in enumerate(image_list):
+                    V = img.shape[0]
+                    v_ids = view_ids_list[b][:V] if view_ids_list[b] is not None else None
 
-            # 约定：VIEW_VOCAB = {PA:0, AP:1, LATERAL:2, OTHER:3}
-            PA_ID, AP_ID, LAT_ID = 0, 1, 2
-
-            for b, x in enumerate(per_sample):
-                # x: (V, N_patch, D_lm)
-                V, Np, D = x.shape
-
-                v_ids = view_ids_list[b][:V] if view_ids_list[b] is not None else None
-                o_ids = orient_ids_list[b][:V] if orient_ids_list[b] is not None else None
-
-                # (1) 视图级 gating（可选）
-                if (view_attn is not None) and (V > 1) and (mv_lambda > 0.0):
-                    # 每个视图做 patch 平均，得到 (V, D) 的 global 特征
-                    global_feats = x.mean(dim=1)                 # (V, D)
-                    scores = view_attn(global_feats)             # (V, 1)
-                    weights = torch.softmax(scores, dim=0)       # (V, 1)
-                    weights_ = weights.view(V, 1, 1)             # (V, 1, 1)
-                    gated_x = weights_ * x                       # (V, Np, D)
-                    x = (1.0 - mv_lambda) * x + mv_lambda * gated_x
-
-                # (2) 对所有视图跑多-slot 融合，得到 M 个 slot token
-                slots, attn = slot_module(x, view_ids=v_ids, orient_ids=o_ids)   # slots: (M, D_lm)
-
-                # (3) 选主视图
-                main_view_idx = 0
-                if V > 1:
-                    if v_ids is not None:
-                        # 优先 PA > AP > LATERAL > 其他
-                        for tgt in (PA_ID, AP_ID, LAT_ID):
-                            mask = (v_ids == tgt)
-                            if mask.any():
-                                main_view_idx = int(mask.nonzero(as_tuple=False)[0])
+                    a = 0
+                    if pick == "INDEX":
+                        a = max(0, min(baseline_index, V - 1))
+                    elif pick == "FIRST":
+                        a = 0
+                    elif pick == "PA_AP_FIRST" and torch.is_tensor(v_ids):
+                        # 注意：pref 的编码必须与你的数据一致；做严格同构时不建议用它
+                        for pref in [0, 1]:
+                            idx = (v_ids == pref).nonzero(as_tuple=True)[0]
+                            if idx.numel() > 0:
+                                a = int(idx[0].item())
                                 break
-                        # 如果都没命中，就保持默认 0
-                    elif (view_attn is not None) and (mv_lambda > 0.0):
-                        # 没有显式 view_ids 时，用 gating 分数选一个视图
-                        with torch.no_grad():
-                            global_feats = x.mean(dim=1)          # (V, D)
-                            scores = view_attn(global_feats)      # (V, 1)
-                            main_view_idx = int(scores.squeeze(-1).argmax())
-                    # else: 留在 0（例如 V=1 时）
+                    else:
+                        a = 0
 
-                # (4) 主视图全 patch + slot 拼接前，加入角色 embedding 与组级 gate
-                main_patches = x[main_view_idx]  # (Np, D)
-                slots = slots  # (M, D)
-                
-                # --- Gate 缩放 ---
-                alpha_s = torch.sigmoid(model.slot_gate)
-                alpha_p = torch.sigmoid(model.patch_gate)
-                slots = alpha_s * slots
-                main_patches = alpha_p * main_patches
-                
-                # --- 拼接 ---
-                cur_feats = torch.cat([main_patches, slots], dim=0)  # (Np + M, D)
-                
-                # --- 角色 embedding ---
-                slot_roles = torch.ones(slots.size(0), dtype=torch.long, device=slots.device)
-                patch_roles = torch.zeros(main_patches.size(0), dtype=torch.long, device=main_patches.device)
-                role_ids = torch.cat([patch_roles, slot_roles], dim=0)
-                role_emb = model.role_embed(role_ids)
-                cur_feats = cur_feats + role_emb  # (Np + M, D)
-                
-                # (5) 如果在 LlavaLlamaModel.__init__ 里定义了角色 embedding，这里加上
-                patch_role_embed = getattr(model, "patch_role_embed", None)
-                slot_role_embed = getattr(model, "slot_role_embed", None)
-                if (patch_role_embed is not None) and (slot_role_embed is not None):
-                    num_slots = slots.size(0)
-                    num_tokens = cur_feats.size(0)
-                    num_patches = num_tokens - num_slots
-                    # 前半段是 patch，后半段是 slot
-                    cur_feats[:num_patches] = cur_feats[:num_patches] + patch_role_embed
-                    cur_feats[num_patches:] = cur_feats[num_patches:] + slot_role_embed
+                    picked.append(img[a])  # (3,H,W)
 
-                fused_features.append(cur_feats)
+                picked_images = torch.stack(picked, dim=0)          # (B,3,H,W)
+                image_features = self.encode_images(picked_images)  # (B,N_patch,D)
 
-                # (6) 收集 slot 正则项
-                if slot_module.last_div_loss is not None:
-                    div_losses.append(slot_module.last_div_loss)
-                if slot_module.last_cov_loss is not None:
-                    cov_losses.append(slot_module.last_cov_loss)
+                # 统一成 list[Tensor(N_patch,D)]
+                image_features = [feat for feat in image_features]
 
-            # 至此，每个 study 的视觉 token：
-            # - 单视图：Np 个该视图的 patch + M 个 slot
-            # - 多视图：主视图 Np 个 patch + M 个 slot
-            image_features = fused_features
+                # cache：study-level global（只保留一份，避免重复计算）
+                self._last_study_image_global = torch.stack([feat.mean(dim=0) for feat in image_features], dim=0)
+                self._last_router_entropy = None
+                self._last_slot_div_loss = None
+                self._last_slot_cov_loss = None
 
-            # 把 batch 内的 slot 正则平均一下，缓存到模型上
-            self._last_slot_div_loss = (
-                torch.stack(div_losses).mean() if len(div_losses) > 0 else None
-            )
-            self._last_slot_cov_loss = (
-                torch.stack(cov_losses).mean() if len(cov_losses) > 0 else None
-            )
-
-            # 为检查级对齐 / CheXpert 缓存 study-level 全局视觉向量
-            if len(image_features) > 0:
-                study_global = torch.stack(
-                    [feat.mean(dim=0) for feat in image_features], dim=0
-                )  # (B, D_lm)
+            # =========================================================
+            # [MULTIVIEW PATH] ar_cvi / 其他多视角融合
+            # =========================================================
             else:
-                study_global = None
-            self._last_study_image_global = study_global
-            # [2025-12-13] 修改了多视图分支的逻辑 结束
+                concat_images = torch.cat(image_list, dim=0)      # (sum_V,3,H,W)
+                all_feats = self.encode_images(concat_images)     # (sum_V,N_patch,D)
 
+                split_sizes = [img.shape[0] for img in image_list]
+                per_sample = torch.split(all_feats, split_sizes, dim=0)  # tuple[(V_i,Np,D)]
 
-            # [2025-12-12] 新增 [CheXpert] study-level global feature，把每个 study 的视觉 token 平均成一个 (B, D) 的全局向量，并存到模型上，供后面计算疾病 loss 使用
-            if image_features is not None:
-                global_feats = []
-                for feat in image_features:
-                    # feat: (N_token, D)
-                    global_feats.append(feat.mean(dim=0))
-                global_feats = torch.stack(global_feats, dim=0)  # (B, D)
-                self._last_study_image_global = global_feats
-            else:
-                self._last_study_image_global = None
-            # [2025-12-12] 新增结束
+                fused_features = []
+                router_ent_losses = []
 
+                view_ids_list = view_ids if view_ids is not None else [None] * len(per_sample)
+                orient_ids_list = orient_ids if orient_ids is not None else [None] * len(per_sample)
 
-            # 把 batch 内的 slot 正则平均一下，缓存到模型上，稍后在 forward 里加到 loss
-            self._last_slot_div_loss = (
-                torch.stack(div_losses).mean() if len(div_losses) > 0 else None
-            )
-            self._last_slot_cov_loss = (
-                torch.stack(cov_losses).mean() if len(cov_losses) > 0 else None
-            )
+                for b, x in enumerate(per_sample):
+                    V, Np, D = x.shape
+                    v_ids = view_ids_list[b][:V] if view_ids_list[b] is not None else None
+                    o_ids = orient_ids_list[b][:V] if orient_ids_list[b] is not None else None
 
+                    if mv_fusion == "ar_cvi":
+                        ar_cvi = getattr(model, "ar_cvi", None)
+                        if ar_cvi is None:
+                            raise RuntimeError("ar_cvi is not found on core model; please init it in LlavaLlamaModel.__init__.")
+
+                        fused_patches, info = ar_cvi(x, view_ids=v_ids, orient_ids=o_ids)
+
+                        # 统计 anchor（确保 counter 初始化）
+                        if os.environ.get("AR_CVI_LOG_ANCHOR", "0") == "1" and info is not None and "anchor_idx" in info:
+                            from collections import Counter
+                            import torch.distributed as dist
+
+                            if not hasattr(self, "_ar_cvi_anchor_counter"):
+                                self._ar_cvi_anchor_counter = Counter()
+                                self._ar_cvi_anchor_total = 0
+
+                            anchor_idx = info["anchor_idx"]
+                            if torch.is_tensor(anchor_idx):
+                                anchor_idx = anchor_idx.detach().flatten()
+                                a = int(anchor_idx.item()) if anchor_idx.numel() == 1 else int(torch.mode(anchor_idx).values.item())
+                            elif isinstance(anchor_idx, (list, tuple)):
+                                a = int(max(set(anchor_idx), key=anchor_idx.count))
+                            else:
+                                a = int(anchor_idx)
+
+                            key = int(v_ids[a].item()) if v_ids is not None else a
+                            self._ar_cvi_anchor_counter[key] += 1
+                            self._ar_cvi_anchor_total += 1
+
+                            log_every = int(os.environ.get("AR_CVI_LOG_EVERY", "512"))
+                            is_rank0 = (not dist.is_available()) or (not dist.is_initialized()) or (dist.get_rank() == 0)
+                            if is_rank0 and (self._ar_cvi_anchor_total % log_every == 0):
+                                print(f"[AR-CVI] anchor_counter (n={self._ar_cvi_anchor_total}): {dict(self._ar_cvi_anchor_counter)}")
+
+                        fused_features.append(fused_patches)
+                        if info is not None and "entropy" in info:
+                            router_ent_losses.append(info["entropy"])
+                    else:
+                        raise RuntimeError(f"Unknown MV_FUSION={mv_fusion}")
+
+                image_features = fused_features
+                self._last_study_image_global = torch.stack([feat.mean(dim=0) for feat in image_features], dim=0)
+                self._last_router_entropy = torch.stack(router_ent_losses).mean() if len(router_ent_losses) > 0 else None
+                self._last_slot_div_loss = None
+                self._last_slot_cov_loss = None
         else:
             # 单视图路径：images 为 (B, 3, H, W)
             image_features = self.encode_images(images)  # (B, N_patch, D_lm)
-            # 为了跟上面统一成 list[Tensor(N_patch,D_lm)]：
             if isinstance(image_features, torch.Tensor):
                 image_features = [feat for feat in image_features]
+            self._last_study_image_global = torch.stack([feat.mean(dim=0) for feat in image_features], dim=0)
+            self._last_router_entropy = None
+
 
 
         # [2025-11-27] 新增：为检查级对齐缓存每个 study 的全局视觉向量

@@ -222,7 +222,10 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
     # 多模态适配器微调保存。当只微调多模态MLP适配器时，只保存适配器相关参数，而不是整个模型
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
-        keys_to_match = ['mm_projector']
+        # [2025-12-14] 修改 train_mem：tune_mm_mlp_adapter 保存时把 AR-CVI 一并保存 开始
+        keys_to_match = ['mm_projector', 'ar_cvi', 'disease_head']
+        # [2025-12-14] 修改 train_mem：tune_mm_mlp_adapter 保存时把 AR-CVI 一并保存 结束
+
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
@@ -1084,10 +1087,12 @@ def train():
 
     # print(f"[INFO] Training modules: {train_modules}")
     # 3.1 多-slot study-level 融合模块
-    if hasattr(core, "slot_fusion"):
-        for p in core.slot_fusion.parameters():
+    # [2025-12-14] 修改 train_mem：解冻 AR-CVI 模块 开始
+    if hasattr(core, "ar_cvi"):
+        for p in core.ar_cvi.parameters():
             p.requires_grad_(True)
-        train_modules.append("slot_fusion")
+        train_modules.append("ar_cvi")
+    # [2025-12-14] 修改 train_mem：解冻 AR-CVI 模块 结束
 
     # 3.2 view-level 融合模块（如果你还打算让它参与训练）
     if hasattr(core, "view_attn"):

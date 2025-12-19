@@ -333,7 +333,40 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 model = LlavaMPTForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-                model = LlavaLlamaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+        
+                # [2025-12-16] 修复：low_cpu_mem_usage=True 遇到 0-dim scalar 参数（例如 gate）会触发 empty() size 报错；
+                # fallback 到 low_cpu_mem_usage=False 时必须移除 device_map / offload 等参数
+                try:
+                    model = LlavaLlamaForCausalLM.from_pretrained(
+                        model_path,
+                        low_cpu_mem_usage=True,
+                        **kwargs
+                    )
+                except TypeError as e:
+                    if "empty() missing 1 required positional arguments" not in str(e):
+                        raise
+                    
+                    # ===== fallback: 禁用 low_cpu_mem_usage，并移除与 device_map 相关的 kwargs =====
+                    fallback_kwargs = dict(kwargs)
+        
+                    # 关键：device_map 只能和 low_cpu_mem_usage=True 搭配，否则 transformers 直接报错
+                    fallback_kwargs.pop("device_map", None)
+                    fallback_kwargs.pop("max_memory", None)
+                    fallback_kwargs.pop("offload_folder", None)
+                    fallback_kwargs.pop("offload_state_dict", None)
+        
+                    model = LlavaLlamaForCausalLM.from_pretrained(
+                        model_path,
+                        low_cpu_mem_usage=False,
+                        **fallback_kwargs
+                    )
+        
+                    # 手动放到设备（单卡 eval 足够）
+                    # 如果你这里的 device 是 torch.device 或字符串都可以
+                    model = model.to(device)
+        
+                # [2025-12-16] 修改结束
+
     else:
         # Load language model
         if model_base is not None:
