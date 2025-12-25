@@ -8,6 +8,8 @@ from transformers.trainer import (
     has_length,
 )
 from typing import List, Optional
+from transformers.trainer_pt_utils import get_parameter_names
+from torch.optim import AdamW
 
 
 # 安全地从DeepSpeed ZeRO-3优化中提取参数
@@ -190,3 +192,39 @@ class LLaVATrainer(Trainer):
             pass
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
+
+# [2025-12-23] 修改了：自定义 Trainer，给 mm_projector / ar_cvi 分配不同学习率
+class _MVTrainer(LLaVATrainer):
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+
+        args = self.args
+        base_lr = args.learning_rate
+        mm_lr = args.mm_projector_lr if args.mm_projector_lr is not None else base_lr
+        ar_lr = args.ar_cvi_lr if args.ar_cvi_lr is not None else base_lr
+
+        decay_parameters = get_parameter_names(self.model, [torch.nn.LayerNorm])
+        decay_parameters = [n for n in decay_parameters if "bias" not in n]
+
+        def pick_lr(name: str) -> float:
+            if "mm_projector" in name:
+                return mm_lr
+            if "ar_cvi" in name:
+                return ar_lr
+            return base_lr
+
+        grouped = []
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            wd = args.weight_decay if name in decay_parameters else 0.0
+            grouped.append({"params": [p], "lr": pick_lr(name), "weight_decay": wd})
+
+        self.optimizer = AdamW(
+            grouped,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_epsilon,
+        )
+        return self.optimizer
+# [2025-12-23] 修改结束

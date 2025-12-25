@@ -130,6 +130,20 @@ class TrainingArguments(transformers.TrainingArguments):  # 扩展 HF 的 Traini
         default=16,
         metadata={"help": "How many bits to use."}
     )
+    # [2025-12-23] 新增了：支持冻结 mm_projector + 设置不同学习率
+    freeze_mm_projector: bool = field(
+        default=False,
+        metadata={"help": "If True, do NOT train mm_projector."}
+    )
+    mm_projector_lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "Learning rate for mm_projector (override base lr)."}
+    )
+    ar_cvi_lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "Learning rate for ar_cvi (override base lr)."}
+    )
+    # [2025-12-23] 新增结束
     # LoRA 相关参数
     lora_enable: bool = False  # 是否启用 LoRA（Low-Rank Adaptation），默认为 False
     lora_r: int = 64  # LoRA 矩阵秩，默认 64
@@ -1043,102 +1057,51 @@ def train():
         )
     model.config.use_cache = False
 
-    # 可选择冻结基础语言模型，只训练适配器
-    # if model_args.freeze_backbone:
-    #     model.model.requires_grad_(False)
+    # [2025-12-23] 新增：统一冻结/解冻策略，便于在 initialize_vision_modules() 后重新应用
+    def apply_freeze_policy(model, model_args, training_args):
+        core = model.get_model()
 
-    # # [2025-11-29] 新增训练相关的代码
-    # core = model.get_model()   # LlavaLlamaModel
+        # 0) 先全冻结（统一入口，避免 requires_grad 被各处逻辑污染后难以追踪）
+        for _, p in model.named_parameters():
+            p.requires_grad_(False)
 
-    # # ✅ 单独解冻 view_attn（多视角融合模块）
-    # if hasattr(core, "view_attn"):
-    #     for p in core.view_attn.parameters():
-    #         p.requires_grad_(True)
+        # 1) 解冻 AR-CVI（你的新模块）
+        if hasattr(core, "ar_cvi"):
+            core.ar_cvi.requires_grad_(True)
 
-    # # ✅ 不想破坏原本的解码头，就把 lm_head 也冻结
-    # for p in model.lm_head.parameters():
-    #     p.requires_grad_(False)
+        # 2) 视图级模块（如你仍希望训练）
+        if hasattr(core, "view_attn"):
+            core.view_attn.requires_grad_(True)
 
-    # ===== [2025-11-29] 冻结 / 解冻策略 =====
-    core = model.get_model()  # LlavaLlamaModel（多模态骨干）
+        # 3) mm_projector：由 freeze_mm_projector 控制（若该参数不存在，则默认“允许训练”，与原逻辑一致）
+        freeze_mm_projector = getattr(training_args, "freeze_mm_projector", None)
+        if freeze_mm_projector is None:
+            freeze_mm_projector = False  # 保持和你原先“默认解冻 mm_projector”的行为一致
 
-    # 1. 冻结整个 backbone
-    core.requires_grad_(False)
+        if hasattr(core, "mm_projector") and (not freeze_mm_projector):
+            core.mm_projector.requires_grad_(True)
 
-    # 2. 冻结 lm_head（输出层）
-    for p in model.lm_head.parameters():
-        p.requires_grad_(False)
+        # 4) 其它 heads（若存在就解冻）
+        for name in ["study_align_head", "disease_head", "text_disease_head"]:
+            if hasattr(core, name):
+                getattr(core, name).requires_grad_(True)
 
-    # 3. 重新打开你要训练的“新模块”
-    train_modules = []
+        # 5) 如果启用 LoRA：把 LoRA 参数重新打开（否则“全冻结”会把 LoRA 一起冻住）
+        if getattr(training_args, "lora_enable", False):
+            for n, p in model.named_parameters():
+                if "lora_" in n:
+                    p.requires_grad_(True)
 
-    # [2025-12-7] 修改 开始
-    # # 3. 允许训练 view_attn
-    # if hasattr(core, "view_attn"):
-    #     for p in core.view_attn.parameters():
-    #         p.requires_grad_(True)
-    #     train_modules.append("view_attn")
+        # 6) lm_head 一般保持冻结（与你原策略一致）
+        if hasattr(model, "lm_head"):
+            for p in model.lm_head.parameters():
+                p.requires_grad_(False)
+    # [2025-12-23] 新增结束
 
-    # # 4. 解冻 mm_projector
-    # if hasattr(core, "mm_projector"):
-    #     for p in core.mm_projector.parameters():
-    #         p.requires_grad_(True)
-    #     train_modules.append("mm_projector")
-
-    # print(f"[INFO] Training modules: {train_modules}")
-    # 3.1 多-slot study-level 融合模块
-    # [2025-12-14] 修改 train_mem：解冻 AR-CVI 模块 开始
-    if hasattr(core, "ar_cvi"):
-        for p in core.ar_cvi.parameters():
-            p.requires_grad_(True)
-        train_modules.append("ar_cvi")
-    # [2025-12-14] 修改 train_mem：解冻 AR-CVI 模块 结束
-
-    # 3.2 view-level 融合模块（如果你还打算让它参与训练）
-    if hasattr(core, "view_attn"):
-        for p in core.view_attn.parameters():
-            p.requires_grad_(True)
-        train_modules.append("view_attn")
-
-    # 3.3 mm_projector：新的视觉 token 分布需要重新对齐到文本空间
-    if hasattr(core, "mm_projector"):
-        for p in core.mm_projector.parameters():
-            p.requires_grad_(True)
-        train_modules.append("mm_projector")
-
-    # 3.4 如果你挂了检查级 / 疾病级对齐头，也一起解冻（没有的话不会进这个分支）
-    if hasattr(core, "study_align_head"):
-        for p in core.study_align_head.parameters():
-            p.requires_grad_(True)
-        train_modules.append("study_align_head")
-
-    if hasattr(core, "disease_head"):
-        for p in core.disease_head.parameters():
-            p.requires_grad_(True)
-        train_modules.append("disease_head")
-
-    if hasattr(core, "text_disease_head"):
-        for p in core.text_disease_head.parameters():
-            p.requires_grad_(True)
-        train_modules.append("text_disease_head")
-
-    # [2025-12-7] 修改 结束
-
-    # 4) 调试打印：看看到底在训谁
-    def rank0_print(*args, **kwargs):
-        # 单卡训练，直接 print；如果将来多卡，可以根据 local_rank 做判断
-        print(*args, **kwargs)
-
-    trainable = [(n, p.numel()) for n, p in model.named_parameters() if p.requires_grad]
-    n_trainable = sum(n for _, n in trainable)
-    n_total = sum(p.numel() for p in model.parameters())
-
-    rank0_print(f"Trainable modules: {train_modules}")
-    rank0_print(f"Trainable params: {n_trainable} / {n_total} "
-                f"({n_trainable / n_total:.4f} of total)")
-    for name, n in trainable:
-        if any(k in name for k in train_modules):
-            rank0_print(f"  - {name}: {n / 1e6:.2f}M params")
+    # [2025-12-23] 修改：删除“提前手动 freeze/unfreeze 一大段”，改为在关键节点统一 apply_freeze_policy
+    # 说明：initialize_vision_modules / tune_mm_mlp_adapter / freeze_mm_mlp_adapter 会覆盖 requires_grad，
+    # 所以不在这里做最终冻结策略。
+    # [2025-12-23] 修改结束
 
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training
@@ -1157,23 +1120,6 @@ def train():
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
     # LoRA适配器：添加低秩适配器进行参数高效微调
-    # if training_args.lora_enable:
-    #     from peft import LoraConfig, get_peft_model
-    #     lora_config = LoraConfig(
-    #         r=training_args.lora_r,
-    #         lora_alpha=training_args.lora_alpha,
-    #         target_modules=find_all_linear_names(model),
-    #         lora_dropout=training_args.lora_dropout,
-    #         bias=training_args.lora_bias,
-    #         task_type="CAUSAL_LM",
-    #     )
-    #     if training_args.bits == 16:
-    #         if training_args.bf16:
-    #             model.to(torch.bfloat16)
-    #         if training_args.fp16:
-    #             model.to(torch.float16)
-    #     rank0_print("Adding LoRA adapters...")
-    #     model = get_peft_model(model, lora_config)
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
 
@@ -1272,6 +1218,11 @@ def train():
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
+        # [2025-12-23] 新增：initialize_vision_modules / tune_mm_mlp_adapter / freeze_mm_mlp_adapter 可能覆盖 requires_grad
+        # 这里强制重新应用冻结策略，保证“最终谁可训练”完全可控
+        apply_freeze_policy(model, model_args, training_args)
+        # [2025-12-23] 新增结束
+
     # 精度一致性：确保所有模块在正确的精度下运行
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
@@ -1286,31 +1237,56 @@ def train():
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    # [2025-12-23] 新增：调试打印必须放在“最后一次 apply_freeze_policy 之后”，否则你看到的并不是真实训练集合
+    core = model.get_model()
+    train_modules = []
+    if hasattr(core, "ar_cvi") and any(p.requires_grad for p in core.ar_cvi.parameters()):
+        train_modules.append("ar_cvi")
+    if hasattr(core, "view_attn") and any(p.requires_grad for p in core.view_attn.parameters()):
+        train_modules.append("view_attn")
+    if hasattr(core, "mm_projector") and any(p.requires_grad for p in core.mm_projector.parameters()):
+        train_modules.append("mm_projector")
+    for name in ["study_align_head", "disease_head", "text_disease_head"]:
+        if hasattr(core, name) and any(p.requires_grad for p in getattr(core, name).parameters()):
+            train_modules.append(name)
+
+    trainable = [(n, p.numel()) for n, p in model.named_parameters() if p.requires_grad]
+    n_trainable = sum(n for _, n in trainable)
+    n_total = sum(p.numel() for p in model.parameters())
+
+    rank0_print(f"Trainable modules: {train_modules}")
+    rank0_print(f"Trainable params: {n_trainable} / {n_total} ({n_trainable / n_total:.4f} of total)")
+    for name, n in trainable:
+        if any(k in name for k in train_modules):
+            rank0_print(f"  - {name}: {n / 1e6:.2f}M params")
+    # [2025-12-23] 新增结束
+
     # 训练执行
-    data_module = make_supervised_data_module(tokenizer=tokenizer,  # 数据准备：创建数据加载模块
+    data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
-    trainer = LLaVATrainer(model=model,  # 训练器初始化：创建LLaVA专用的训练器
+
+    trainer = LLaVATrainer(model=model,
                            tokenizer=tokenizer,
                            args=training_args,
                            **data_module)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):  # 检查是否有已有的检查点，支持断点续训
+    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
-    trainer.save_state()  # 状态保存：保存训练状态
+    trainer.save_state()
 
     # 模型保存
     model.config.use_cache = True
 
-    if training_args.lora_enable:  # 如果使用LoRA，保存LoRA适配器和非LoRA参数
+    if training_args.lora_enable:
         state_dict = get_peft_state_maybe_zero_3(
             model.named_parameters(), training_args.lora_bias
         )
         non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
             model.named_parameters()
         )
-        if training_args.local_rank == 0 or training_args.local_rank == -1:  # 仅主进程保存模型，避免重复写入
+        if training_args.local_rank == 0 or training_args.local_rank == -1:
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))

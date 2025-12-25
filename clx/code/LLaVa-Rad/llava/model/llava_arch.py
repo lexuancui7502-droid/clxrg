@@ -308,6 +308,10 @@ class TokenLearnerLite(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.score = nn.Linear(dim, num_tokens, bias=False)
 
+        # [2025-12-22] 新增，logits 全 0 -> softmax 均匀 -> K 个 token 初期都是平均池化版本
+        nn.init.zeros_(self.score.weight)
+        # [2025-12-22] 新增结束
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (N,D)
@@ -376,6 +380,11 @@ class SharedMemoryCVI(nn.Module):
           evidence_new: (V,K,D)
           mem_new: (M,D)
         """
+        # [2025-12-25] 新增：eval阶段 + 禁用fuser 时，直接跳过CVI交互，防止扰动
+        if (not self.training) and os.getenv("AR_CVI_DISABLE_FUSER", "0") == "1":
+            mem_out = self.mem[0] if self.mem.dim() == 3 else self.mem  # (M,D)
+            return evidence, mem_out
+        # [2025-12-25] 新增结束
         V, K, D = evidence.shape
         E = evidence.reshape(1, V * K, D)              # (1, VK, D)
         M = self.mem.expand(1, -1, -1)                 # (1, M, D)
@@ -437,6 +446,17 @@ class MemoryConditionedAnchorRouter(nn.Module):
         tau: float = 1.0,
     ):
         V, K, D = evidence.shape
+
+        # [2025-12-19] 新增硬fallback
+        # 如果没有 view_ids（mvwrap/test 很常见），必须与 baseline 一致：选第0张
+        if view_ids is None or view_ids.numel() == 0:
+            scores = evidence.new_zeros(V)
+            probs  = torch.zeros(V, device=evidence.device)
+            probs[0] = 1.0
+            entropy = torch.tensor(0.0, device=evidence.device)
+            return 0, probs, entropy, scores
+        # [2025-12-19] 新增结束
+
         mem_q = mem.mean(dim=0)                       # (D,)
 
         q = self.q_proj(mem_q)                        # (d,)
@@ -477,8 +497,27 @@ class GatedAnchorFuser(nn.Module):
         super().__init__()
         self.ln = nn.LayerNorm(dim)
         self.attn = _CrossAttnLite(dim, attn_dim, num_heads, dropout)
-        # gate 初始很小 => 先当作 baseline，再逐步学会用辅助视角
-        self.gate = nn.Parameter(torch.tensor(-6.0))
+
+        # [2025-12-23] 修改了：fuser 门控/尺度由环境变量控制，并支持“强制重置恒等初始化”
+        self._gate_init = float(os.getenv("AR_CVI_GATE_INIT", "-6.0"))   # 训练建议先用 -2 ~ -4，eval 可用 -6
+        self._gate_max  = float(os.getenv("AR_CVI_GATE_MAX", "1.0"))     # 训练早期建议 0.1~0.3
+        self.gate = nn.Parameter(torch.tensor(self._gate_init))
+        # [2025-12-23] 修改结束
+
+        # [2025-12-22] 新增，让 CrossAttn 输出在初始化时≈0（残差分支零初始化）
+        nn.init.zeros_(self.attn.o_proj.weight)
+        # [2025-12-22] 新增结束
+
+        # [2025-12-23] 修改了：补上一个显式 reset 接口（用于防止 checkpoint 覆盖初始化）
+        self._did_force_reinit = False
+        # [2025-12-23] 修改结束
+
+    # [2025-12-23] 新增了 reset_to_identity，确保 fuser 回到恒等附近
+    @torch.no_grad()
+    def reset_to_identity(self):
+        nn.init.zeros_(self.attn.o_proj.weight)
+        self.gate.fill_(self._gate_init)
+    # [2025-12-23] 新增结束
 
     def forward(self, anchor_patches: torch.Tensor, aux_tokens: torch.Tensor) -> torch.Tensor:
         """
@@ -486,11 +525,18 @@ class GatedAnchorFuser(nn.Module):
         aux_tokens:     (S,D)
         return:         (Np,D)
         """
-        B = 1
+        # [2025-12-23] 修改了：支持运行时强制重置（用于你跑 Step B/B2 这类“只测结构不训练”的 sanity check）
+        if (not self.training) and (not self._did_force_reinit) and os.getenv("AR_CVI_FORCE_REINIT", "0") == "1":
+            self.reset_to_identity()
+            self._did_force_reinit = True
+        # [2025-12-23] 修改结束
+        # B = 1
         q = self.ln(anchor_patches).unsqueeze(0)   # (1,Np,D)
         kv = aux_tokens.unsqueeze(0)               # (1,S,D)
         delta = self.attn(q, kv).squeeze(0)        # (Np,D)
-        g = torch.sigmoid(self.gate)               # scalar ~0 at init
+        g = torch.sigmoid(self.gate) * self._gate_max               # scalar ~0 at init
+        if (not self.training) and g.item() < 1e-5:
+            return anchor_patches
         return anchor_patches + g * delta
 
 class ARCVIFusion(nn.Module):
@@ -548,10 +594,62 @@ class ARCVIFusion(nn.Module):
         if orient_ids is not None:
             orient_ids = orient_ids.to(x.device)
 
-        anchor_idx, probs, entropy, scores = self.router(
-            evid, mem, view_ids=view_ids, orient_ids=orient_ids,
-            hard=self.router_hard, tau=self.router_tau
-        )
+        # anchor_idx, probs, entropy, scores = self.router(
+        #     evid, mem, view_ids=view_ids, orient_ids=orient_ids,
+        #     hard=self.router_hard, tau=self.router_tau
+        # )
+
+        # =========================
+        # [2025-12-19] 新增eval-only: 强制 AR-CVI anchor 选择与 baseline 同构
+        # =========================
+        if (not self.training) and os.environ.get("AR_CVI_MATCH_BASELINE", "0") == "1":
+            pick = os.environ.get("MV_BASELINE_PICK", "INDEX").upper()
+            baseline_index = int(os.environ.get("MV_BASELINE_INDEX", "0"))
+
+            # 默认：与 baseline 一样的 INDEX/FIRST 规则
+            if pick in ("INDEX", "FIRST"):
+                anchor_idx = max(0, min(baseline_index, V - 1))
+
+            # 可选：若你 baseline 支持 PA/AP 优先，这里也可以复刻
+            elif pick in ("PA_AP_FIRST", "PAAPFIRST"):
+                # 需要 view_ids 可用；否则退化到 0
+                anchor_idx = 0
+                if view_ids is not None and view_ids.numel() == V:
+                    # 假设 VIEW: PA=0, AP=1
+                    pa = (view_ids == 0).nonzero(as_tuple=False)
+                    ap = (view_ids == 1).nonzero(as_tuple=False)
+                    if pa.numel() > 0:
+                        anchor_idx = int(pa[0].item())
+                    elif ap.numel() > 0:
+                        anchor_idx = int(ap[0].item())
+
+            else:
+                # 未知策略：保守退化到 0（保证可复现）
+                anchor_idx = 0
+
+            # 构造与 router 返回一致的占位输出
+            probs = x.new_zeros((V,))
+            probs[anchor_idx] = 1.0
+            entropy = x.new_zeros(())
+            scores = x.new_zeros((V,))
+
+        else:
+            # [2025-12-19] 修改，只在训练时允许“hard”
+            hard = self.router_hard and self.training
+            tau  = self.router_tau if self.training else 1.0
+            anchor_idx, probs, entropy, scores = self.router(
+                evid, mem, view_ids=view_ids, orient_ids=orient_ids,
+                hard=hard, tau=tau
+            )
+            # [2025-12-19] 修改结束
+        # [2025-12-19] 新增eval-only结束: 强制 AR-CVI anchor 选择与 baseline 同构
+
+        # ====== [2025-12-22] 新增：eval-only，禁用融合注入，只看“选主视角”本身影响 ======
+        if (not self.training) and (os.environ.get("AR_CVI_DISABLE_FUSER", "0") == "1"):
+            fused = x[anchor_idx]
+            info = {"anchor_idx": anchor_idx, "entropy": entropy, "probs": probs, "scores": scores}
+            return fused, info
+        # ====== [2025-12-22] 新增结束 ========
 
         aux_list = [evid[i] for i in range(V) if i != anchor_idx]
         aux_tokens = torch.cat(aux_list + [mem], dim=0)   # ( (V-1)*K + M, D )
@@ -855,20 +953,6 @@ class LlavaMetaForCausalLM(ABC):
             self._last_study_image_global = torch.stack([feat.mean(dim=0) for feat in image_features], dim=0)
             self._last_router_entropy = None
 
-
-
-        # [2025-11-27] 新增：为检查级对齐缓存每个 study 的全局视觉向量
-        # 此时 image_features 是长度为 B 的 list，每个元素形状 (N_patch, D_lm)
-        # if len(image_features) > 0:
-        #     # 对 patch 维度做平均，得到 (B, D_lm) 的 study-level 表征
-        #     study_global = torch.stack(
-        #         [feat.mean(dim=0) for feat in image_features],
-        #         dim=0
-        #     )  # (B, D_lm)
-        #     # 直接挂在模型实例上，供 forward() 使用
-        #     self._last_study_image_global = study_global
-        # else:
-        #     self._last_study_image_global = None
 
         # 准备存储新的输入嵌入和标签
         new_input_embeds = []
