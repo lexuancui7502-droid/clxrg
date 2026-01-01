@@ -430,7 +430,7 @@ class MemoryConditionedAnchorRouter(nn.Module):
             # 假设 VIEW: PA=0, AP=1, LAT=2, OTHER=3, PAD=4
             self.view_bias.weight.zero_()
             if num_view_types >= 3:
-                self.view_bias.weight[0] = 0.5  # PA
+                self.view_bias.weight[0] = 0.7  # PA
                 self.view_bias.weight[1] = 0.2  # AP
                 self.view_bias.weight[2] = 0.1  # LAT
             # orient bias 默认 0
@@ -496,26 +496,31 @@ class GatedAnchorFuser(nn.Module):
     def __init__(self, dim: int, attn_dim: int = 1024, num_heads: int = 8, dropout: float = 0.0):
         super().__init__()
         self.ln = nn.LayerNorm(dim)
-        self.attn = _CrossAttnLite(dim, attn_dim, num_heads, dropout)
+        self.attn = _CrossAttnLite(dim, attn_dim=attn_dim, num_heads=num_heads, dropout=dropout)
 
         # [2025-12-23] 修改了：fuser 门控/尺度由环境变量控制，并支持“强制重置恒等初始化”
         self._gate_init = float(os.getenv("AR_CVI_GATE_INIT", "-6.0"))   # 训练建议先用 -2 ~ -4，eval 可用 -6
         self._gate_max  = float(os.getenv("AR_CVI_GATE_MAX", "1.0"))     # 训练早期建议 0.1~0.3
-        self.gate = nn.Parameter(torch.tensor(self._gate_init))
+        self.gate = nn.Parameter(torch.tensor(self._gate_init, dtype=torch.float32))
         # [2025-12-23] 修改结束
 
         # [2025-12-22] 新增，让 CrossAttn 输出在初始化时≈0（残差分支零初始化）
-        nn.init.zeros_(self.attn.o_proj.weight)
+        # nn.init.zeros_(self.attn.o_proj.weight)
         # [2025-12-22] 新增结束
 
         # [2025-12-23] 修改了：补上一个显式 reset 接口（用于防止 checkpoint 覆盖初始化）
         self._did_force_reinit = False
         # [2025-12-23] 修改结束
 
+        # [2025-12-25] 新增：初始化时把输出投影置零，使“未训练/强约束”更接近恒等
+        with torch.no_grad():
+            self.attn.o_proj.weight.zero_()
+
     # [2025-12-23] 新增了 reset_to_identity，确保 fuser 回到恒等附近
     @torch.no_grad()
     def reset_to_identity(self):
-        nn.init.zeros_(self.attn.o_proj.weight)
+        # nn.init.zeros_(self.attn.o_proj.weight)
+        self.attn.o_proj.weight.zero_()
         self.gate.fill_(self._gate_init)
     # [2025-12-23] 新增结束
 
@@ -526,15 +531,16 @@ class GatedAnchorFuser(nn.Module):
         return:         (Np,D)
         """
         # [2025-12-23] 修改了：支持运行时强制重置（用于你跑 Step B/B2 这类“只测结构不训练”的 sanity check）
-        if (not self.training) and (not self._did_force_reinit) and os.getenv("AR_CVI_FORCE_REINIT", "0") == "1":
+        if (not self._did_force_reinit) and os.getenv("AR_CVI_FORCE_REINIT", "0") == "1":
             self.reset_to_identity()
             self._did_force_reinit = True
         # [2025-12-23] 修改结束
-        # B = 1
+        
         q = self.ln(anchor_patches).unsqueeze(0)   # (1,Np,D)
         kv = aux_tokens.unsqueeze(0)               # (1,S,D)
         delta = self.attn(q, kv).squeeze(0)        # (Np,D)
-        g = torch.sigmoid(self.gate) * self._gate_max               # scalar ~0 at init
+
+        g = (torch.sigmoid(self.gate) * self._gate_max).to(delta.dtype)               # scalar ~0 at init
         if (not self.training) and g.item() < 1e-5:
             return anchor_patches
         return anchor_patches + g * delta
@@ -712,7 +718,15 @@ class LlavaMetaModel:
         self.config.mm_vision_select_layer = mm_vision_select_layer         # 设置视觉特征选择层
         self.config.mm_vision_select_feature = mm_vision_select_feature     # 设置视觉特征选择方式
 
-        self.mm_projector = build_vision_projector(self.config)         # 构建多模态投影器
+        # self.mm_projector = build_vision_projector(self.config)         # 构建多模态投影器
+        # [2025-12-29] 重新修改，让mm_Projector不会再初始化训练
+        if getattr(self, "mm_projector", None) is None:
+            self.mm_projector = build_vision_projector(self.config)
+        else:
+            # 保留已加载的 mm_projector 权重；确保可训练
+            for p in self.mm_projector.parameters():
+                p.requires_grad = True
+        # [2025-12-29] 修改结束
 
         # 加载预训练的投影器权重
         if pretrain_mm_mlp_adapter is not None:         # 支持从检查点加载预训练权重，加速收敛或保持性能
@@ -840,7 +854,7 @@ class LlavaMetaForCausalLM(ABC):
             # [STRICT BASELINE] 先选定每个 study 的一张图，再走单视角 encode
             # =========================================================
             if mv_fusion == "baseline":
-                pick = os.environ.get("MV_BASELINE_PICK", "INDEX")  # 建议默认 INDEX
+                pick = os.environ.get("MV_BASELINE_PICK", "INDEX").strip().upper()
                 baseline_index = int(os.environ.get("MV_BASELINE_INDEX", "0"))
 
                 picked = []
@@ -855,9 +869,10 @@ class LlavaMetaForCausalLM(ABC):
                         a = max(0, min(baseline_index, V - 1))
                     elif pick == "FIRST":
                         a = 0
-                    elif pick == "PA_AP_FIRST" and torch.is_tensor(v_ids):
+                    elif pick in ("PA_AP_FIRST", "PAAPFIRST") and torch.is_tensor(v_ids):
                         # 注意：pref 的编码必须与你的数据一致；做严格同构时不建议用它
-                        for pref in [0, 1]:
+                        a = 0
+                        for pref in (0, 1):
                             idx = (v_ids == pref).nonzero(as_tuple=True)[0]
                             if idx.numel() > 0:
                                 a = int(idx[0].item())

@@ -35,7 +35,7 @@ import transformers
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, \
     DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
-from llava.train.llava_trainer import LLaVATrainer
+from llava.train.llava_trainer import LLaVATrainer, _MVTrainer
 
 from llava import conversation as conversation_lib
 from llava.model import *
@@ -85,7 +85,7 @@ class ModelArguments:  # 控制模型选择与结构级别的多模态选项
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)  # 预训练的多模态 MLP 适配器路径，用于初始化，默认为None
     mm_projector_type: Optional[str] = field(default='linear')  # 多模态投影器类型，默认 'linear'（线性投影）
     mm_use_im_start_end: bool = field(default=False)  # 多模态是否在图像标记中使用开始和结束标记，默认为 False
-    mm_use_im_patch_token: bool = field(default=True)  # 多模态是否使用图像补丁标记，默认为 True
+    mm_use_im_patch_token: bool = field(default=False)  # 多模态是否使用图像补丁标记，默认为 True
     mm_vision_select_feature: Optional[str] = field(default="patch")  # 多模态视觉特征选择方式，默认 "patch"（补丁特征）
 
 
@@ -236,17 +236,20 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
     # 多模态适配器微调保存。当只微调多模态MLP适配器时，只保存适配器相关参数，而不是整个模型
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
-        # [2025-12-14] 修改 train_mem：tune_mm_mlp_adapter 保存时把 AR-CVI 一并保存 开始
-        keys_to_match = ['mm_projector', 'ar_cvi', 'disease_head']
-        # [2025-12-14] 修改 train_mem：tune_mm_mlp_adapter 保存时把 AR-CVI 一并保存 结束
-
+        # [2025-12-25] 修改：tune_mm_mlp_adapter 保存时，keys_to_match 统一为“并集”，兼容有/无 vision_resampler，并确保 AR-CVI 等模块不会在 checkpoint 路径丢失 开始
+        # 说明：
+        # - vision_resampler：如果模型里不存在该模块，get_mm_adapter_state_maybe_zero_3 匹配不到会自动忽略，不会报错
+        # - 仍保持文件名 mm_projector.bin / checkpoint-xxx.bin 不变，避免破坏你当前的加载逻辑
+        keys_to_match = ['mm_projector', 'vision_resampler', 'ar_cvi', 'disease_head']
+        # [2025-12-25] 修改结束
+    
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
-
+    
         # 使用之前介绍的函数获取多模态适配器参数
         weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
         trainer.model.config.save_pretrained(output_dir)
-
+    
         # 保存多模态适配器参数到指定目录
         current_folder = output_dir.split('/')[-1]
         parent_folder = os.path.dirname(output_dir)
@@ -1265,7 +1268,7 @@ def train():
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
 
-    trainer = LLaVATrainer(model=model,
+    trainer = _MVTrainer(model=model,
                            tokenizer=tokenizer,
                            args=training_args,
                            **data_module)

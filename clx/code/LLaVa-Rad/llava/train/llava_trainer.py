@@ -193,6 +193,8 @@ class LLaVATrainer(Trainer):
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
 
+from transformers.optimization import get_scheduler
+
 # [2025-12-23] 修改了：自定义 Trainer，给 mm_projector / ar_cvi 分配不同学习率
 class _MVTrainer(LLaVATrainer):
     def create_optimizer(self):
@@ -206,25 +208,71 @@ class _MVTrainer(LLaVATrainer):
 
         decay_parameters = get_parameter_names(self.model, [torch.nn.LayerNorm])
         decay_parameters = [n for n in decay_parameters if "bias" not in n]
-
-        def pick_lr(name: str) -> float:
-            if "mm_projector" in name:
+        # [2025-12-25] 修改了部分代码，更可读
+        def pick_lr(n: str) -> float:
+            if "mm_projector" in n:
                 return mm_lr
-            if "ar_cvi" in name:
+            if "ar_cvi" in n:
                 return ar_lr
             return base_lr
 
-        grouped = []
+        buckets = {}  # (lr, wd) -> param group
         for name, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
             wd = args.weight_decay if name in decay_parameters else 0.0
-            grouped.append({"params": [p], "lr": pick_lr(name), "weight_decay": wd})
+            lr = pick_lr(name)
+            key = (lr, wd)
+            if key not in buckets:
+                buckets[key] = {"params": [], "lr": lr, "weight_decay": wd}
+            buckets[key]["params"].append(p)
 
         self.optimizer = AdamW(
-            grouped,
+            list(buckets.values()),
             betas=(args.adam_beta1, args.adam_beta2),
             eps=args.adam_epsilon,
         )
+
+        # rank0 打印 group 概览
+        print("[DEBUG] Optimizer groups:")
+        for (lr, wd), g in buckets.items():
+            n = sum(p.numel() for p in g["params"])
+            print(f"  - lr={lr:.2e} wd={wd:.2e} params={n/1e6:.2f}M")
+        # [2025-12-25] 修改结束
         return self.optimizer
-# [2025-12-23] 修改结束
+
+    # [2025-12-26] 新增学习率相关代码
+    def create_scheduler(self, num_training_steps: int, optimizer: Optional[torch.optim.Optimizer] = None):
+        """确保多 param group 都跟随相同 scheduler 曲线变化"""
+        from transformers.optimization import get_scheduler
+
+        args = self.args
+        num_warmup_steps = int(num_training_steps * args.warmup_ratio)
+
+        # 如果外部传了 optimizer（例如 DeepSpeed 调用），用它；否则用当前 trainer.optimizer
+        if optimizer is None:
+            optimizer = self.optimizer
+
+        scheduler = get_scheduler(
+            args.lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+
+        # 同步每个 param_group 的初始 lr
+        for i, group in enumerate(optimizer.param_groups):
+            group.setdefault("initial_lr", group["lr"])
+            print(f"[DEBUG] Scheduler bound to group {i}: initial_lr={group['initial_lr']:.2e}")
+
+        self.lr_scheduler = scheduler
+        return self.lr_scheduler
+    # [2025-12-26] 新增结束
+
+    # [2025-12-27] 新增打印学习率的函数
+    def log(self, logs):
+        if getattr(self, "optimizer", None) is not None:
+            for i, g in enumerate(self.optimizer.param_groups):
+                logs[f"lr/group_{i}"] = g.get("lr", None)
+        return super().log(logs)
+    # [2025-12-27] 新增结束
