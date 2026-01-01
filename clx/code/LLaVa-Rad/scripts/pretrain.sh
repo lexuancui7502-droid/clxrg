@@ -2,7 +2,9 @@
 
 # Uncomment and set the following variables correspondingly to run this script:
 # 基础模型与输出目录
-model_base=lmsys/vicuna-7b-v1.5         # 基座 LLM（Vicuna-7B）
+# model_base=lmsys/vicuna-7b-v1.5         # 基座 LLM（Vicuna-7B）
+WEIGHTS_ROOT=/media/cuilexuan/clx/weights
+model_base="${WEIGHTS_ROOT}/vicuna-7b-v1.5"          # 修改为本地
 output_dir=/media/cuilexuan/clx/results/llavarad_pretrain     # 输出目录
 
 # 训练数据路径

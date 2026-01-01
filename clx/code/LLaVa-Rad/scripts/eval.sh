@@ -60,9 +60,10 @@ BASE_ROOT="${BASE_ROOT:-/media/cuilexuan/clx}"
 WEIGHTS_ROOT="${WEIGHTS_ROOT:-$BASE_ROOT/weights}"
 
 MODEL_BASE="${MODEL_BASE:-$WEIGHTS_ROOT/vicuna-7b-v1.5}"          # Vicuna base（本地）
-MODEL_PATH="${MODEL_PATH:-$WEIGHTS_ROOT/llava-rad}"                # 权重适配器LLaVA-Rad（本地）
-# QUERY_FILE="${QUERY_FILE:-$BASE_ROOT/data/llava-rad-mimic-cxr-annotations-1.0.0/chat_test_MIMIC_CXR_all_gpt4extract_rulebased_v1.json}"
-QUERY_FILE="${QUERY_FILE:-$BASE_ROOT/data/llava-rad-mimic-cxr-annotations-1.0.0/_mini_100.json}"  # 注释 JSON
+# MODEL_PATH="${MODEL_PATH:-$WEIGHTS_ROOT/llava-rad}"                # 权重适配器LLaVA-Rad（本地）
+MODEL_PATH="/media/cuilexuan/clx/results/stage1_view_attention/biomedclip_cxr_518-lora-2e-1e-4-20251120115738"
+QUERY_FILE="${QUERY_FILE:-$BASE_ROOT/data/multiview-cxr-annotations-1.0.0/multiview_and_single_test_data.json}"       # 多视角注释 JSON
+# QUERY_FILE="${QUERY_FILE:-$BASE_ROOT/data/llava-rad-mimic-cxr-annotations-1.0.0/chat_test_MIMIC_CXR_all_gpt4extract_rulebased_v1.json}"  # 单视角注释 JSON
 IMAGE_FOLDER="${IMAGE_FOLDER:-/media/datasets/physionet.org/files/mimic-cxr-jpg/2.0.0/files}"     # MIMIC-CXR-JPG 图像根目录
 
 STAMP="$(date +%m%d_%H%M)"
@@ -85,7 +86,7 @@ set -x
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
 python -m llava.eval.model_mimic_cxr \
   --query_file "$QUERY_FILE" \
-  --loader "mimic_test_findings" \
+  --loader "mimic_multiview_findings" \
   --image_folder "$IMAGE_FOLDER" \
   --conv_mode "v1" \
   --prediction_file "$OUTDIR/test_0.jsonl" \
