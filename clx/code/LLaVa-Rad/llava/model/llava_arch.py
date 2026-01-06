@@ -608,7 +608,23 @@ class ARCVIFusion(nn.Module):
         # =========================
         # [2025-12-19] 新增eval-only: 强制 AR-CVI anchor 选择与 baseline 同构
         # =========================
-        if (not self.training) and os.environ.get("AR_CVI_MATCH_BASELINE", "0") == "1":
+        # [2026-1-1] 修改主视角的选择逻辑，目前固定主视角
+        match_baseline = os.environ.get("AR_CVI_MATCH_BASELINE", "0") == "1"
+        match_baseline_train = os.environ.get("AR_CVI_MATCH_BASELINE_TRAIN", "0") == "1"
+        # [2026-1-2] 新增打印节流器
+        # === DEBUG gate: 控制打印频率 & 只在 rank0 打印 ===
+        dbg = (os.environ.get("AR_CVI_DEBUG_ANCHOR", "0") == "1")
+        if dbg and int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            if not hasattr(self, "_ar_cvi_dbg_step"):
+                self._ar_cvi_dbg_step = 0
+            self._ar_cvi_dbg_step += 1
+            log_every = int(os.environ.get("AR_CVI_LOG_EVERY", "1024"))
+            do_log = (log_every <= 1) or (self._ar_cvi_dbg_step % log_every == 0)
+        else:
+            do_log = False
+        # [2026-1-2] 新增结束
+        if match_baseline and ((not self.training) or match_baseline_train):
+        # [2026-1-1] 修改结束
             pick = os.environ.get("MV_BASELINE_PICK", "INDEX").upper()
             baseline_index = int(os.environ.get("MV_BASELINE_INDEX", "0"))
 
@@ -616,23 +632,42 @@ class ARCVIFusion(nn.Module):
             if pick in ("INDEX", "FIRST"):
                 anchor_idx = max(0, min(baseline_index, V - 1))
 
-            # 可选：若你 baseline 支持 PA/AP 优先，这里也可以复刻
-            elif pick in ("PA_AP_FIRST", "PAAPFIRST"):
-                # 需要 view_ids 可用；否则退化到 0
+            # [2026-1-1] 固定主视角选择策略
+            elif pick in ("PA_AP_FIRST", "PAAPFIRST", "FRONTAL_FIRST", "FRONTALFIRST"):
+                # 规则：PA/AP（正位）优先；都没有才选 LATERAL；再没有就 0
                 anchor_idx = 0
                 if view_ids is not None and view_ids.numel() == V:
-                    # 假设 VIEW: PA=0, AP=1
-                    pa = (view_ids == 0).nonzero(as_tuple=False)
-                    ap = (view_ids == 1).nonzero(as_tuple=False)
+                    pa  = (view_ids == 0).nonzero(as_tuple=False)  # PA
+                    ap  = (view_ids == 1).nonzero(as_tuple=False)  # AP
+                    lat = (view_ids == 2).nonzero(as_tuple=False)  # LATERAL
+
+                    # 你要的是“AP/PA 优先”，这里保持确定性：PA 优先于 AP（如你想 AP 优先，把两行交换即可）
                     if pa.numel() > 0:
                         anchor_idx = int(pa[0].item())
                     elif ap.numel() > 0:
                         anchor_idx = int(ap[0].item())
+                    elif lat.numel() > 0:
+                        anchor_idx = int(lat[0].item())
+                    else:
+                        anchor_idx = 0
+            # [2026-1-1] 固定主视角选择策略结束
 
             else:
                 # 未知策略：保守退化到 0（保证可复现）
                 anchor_idx = 0
-
+            # [2026-1-2] 新增打印锚点选择日志
+            if do_log:
+                v_list = view_ids.detach().cpu().tolist() if view_ids is not None else None
+                o_list = orient_ids.detach().cpu().tolist() if orient_ids is not None else None
+                anchor_view = None
+                if view_ids is not None and view_ids.numel() == V:
+                    anchor_view = int(view_ids[anchor_idx].item())
+                print(
+                    f"[AR-CVI][branch=match_baseline][train={self.training}] "
+                    f"pick={pick} V={V} view_ids={v_list} orient_ids={o_list} "
+                    f"-> anchor_idx={anchor_idx} anchor_view={anchor_view}"
+                )
+            # [2026-1-2] 新增打印锚点选择日志结束
             # 构造与 router 返回一致的占位输出
             probs = x.new_zeros((V,))
             probs[anchor_idx] = 1.0
@@ -648,6 +683,18 @@ class ARCVIFusion(nn.Module):
                 hard=hard, tau=tau
             )
             # [2025-12-19] 修改结束
+            # [2026-1-2] 新增打印锚点选择日志
+            if do_log:
+                v_list = view_ids.detach().cpu().tolist() if view_ids is not None else None
+                o_list = orient_ids.detach().cpu().tolist() if orient_ids is not None else None
+                p_list = probs.detach().float().cpu().tolist() if probs is not None else None
+                s_list = scores.detach().float().cpu().tolist() if scores is not None else None
+                print(
+                    f"[AR-CVI][branch=router][train={self.training}] "
+                    f"hard={hard} tau={tau} V={V} view_ids={v_list} orient_ids={o_list} "
+                    f"-> anchor_idx={int(anchor_idx)} probs={p_list} scores={s_list}"
+                )
+            # [2026-1-2] 新增打印锚点选择日志结束
         # [2025-12-19] 新增eval-only结束: 强制 AR-CVI anchor 选择与 baseline 同构
 
         # ====== [2025-12-22] 新增：eval-only，禁用融合注入，只看“选主视角”本身影响 ======
@@ -869,17 +916,34 @@ class LlavaMetaForCausalLM(ABC):
                         a = max(0, min(baseline_index, V - 1))
                     elif pick == "FIRST":
                         a = 0
-                    elif pick in ("PA_AP_FIRST", "PAAPFIRST") and torch.is_tensor(v_ids):
-                        # 注意：pref 的编码必须与你的数据一致；做严格同构时不建议用它
+                    # [2026-1-2] 把代码改为PA 优先于 AP
+                    elif pick in ("PA_AP_FIRST", "PAAPFIRST", "FRONTAL_FIRST", "FRONTALFIRST") and torch.is_tensor(v_ids):
+                        # 规则：PA/AP 优先；都没有才选 LATERAL；再没有就 0
                         a = 0
-                        for pref in (0, 1):
-                            idx = (v_ids == pref).nonzero(as_tuple=True)[0]
-                            if idx.numel() > 0:
-                                a = int(idx[0].item())
-                                break
+                        pa  = (v_ids == 0).nonzero(as_tuple=True)[0]
+                        ap  = (v_ids == 1).nonzero(as_tuple=True)[0]
+                        lat = (v_ids == 2).nonzero(as_tuple=True)[0]
+
+                        if pa.numel() > 0:
+                            a = int(pa[0].item())
+                        elif ap.numel() > 0:
+                            a = int(ap[0].item())
+                        elif lat.numel() > 0:
+                            a = int(lat[0].item())
+                        else:
+                            a = 0    
+                    # [2026-1-2] 修改结束
                     else:
                         a = 0
+                    # [2026-1-2] 新增打印代码
+                    debug = os.environ.get("AR_CVI_DEBUG_ANCHOR", "0") == "1"
+                    is_rank0 = int(os.environ.get("LOCAL_RANK", "0")) == 0
 
+                    if debug and is_rank0 and (not self.training):
+                        v_list = None if (v_ids is None) else v_ids.detach().cpu().tolist()
+                        chosen = None if (v_ids is None) else int(v_ids[a].item())
+                        print(f"[ANCHOR][baseline] b={b} pick={pick} V={V} view_ids={v_list} -> a={a}, view={chosen}")
+                    # [2026-1-2] 新增结束
                     picked.append(img[a])  # (3,H,W)
 
                 picked_images = torch.stack(picked, dim=0)          # (B,3,H,W)

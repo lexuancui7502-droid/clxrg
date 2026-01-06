@@ -180,48 +180,6 @@ def eval_model(
     os.makedirs(os.path.dirname(prediction_file), exist_ok=True)
     pred_file = open(prediction_file, "w")
     log_prediction = True
-    # 原本是每个样本一张图，现在要进行修改
-    # batches = create_batches(queries, batch_size, group_by_length, tokenizer)
-    # for batch_queries in tqdm(batches):
-    #     batch_prompts = []
-    #     batch_input_ids = []
-    #     batch_images = []
-    #     for query in batch_queries:
-    #         q = query["conversations"][0]["value"]
-
-    #         q = q.replace("<image>", "").strip()
-    #         if model.config.mm_use_im_start_end:
-    #             q = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + q
-    #         else:
-    #             q = DEFAULT_IMAGE_TOKEN + '\n' + q
-
-    #         conv= conv_templates[conv_mode].copy()
-    #         conv.append_message(conv.roles[0], q)
-    #         conv.append_message(conv.roles[1], None)
-    #         prompt = conv.get_prompt()
-
-    #         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
-
-    #         image = Image.open(os.path.join(image_folder, query["image"])).convert("RGB")
-    #         image_tensor = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-
-    #         batch_prompts.append(prompt)
-    #         batch_input_ids.append(input_ids)
-    #         batch_images.append(image_tensor)
-
-    #     stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-        
-
-    #     with torch.inference_mode():
-    #         batch_output_ids = model.generate(
-    #             torch.stack(batch_input_ids).cuda(),
-    #             images=torch.stack(batch_images).half().cuda(),
-    #             do_sample=True if temperature > 0 else False,
-    #             temperature=temperature,
-    #             top_p=top_p,
-    #             num_beams=num_beams,
-    #             max_new_tokens=256,
-    #             use_cache=True).cpu()
     
     # [2025-11-18] 读图 + 组 batch + generate
     batches = create_batches(queries, batch_size, group_by_length, tokenizer)
@@ -229,6 +187,8 @@ def eval_model(
         batch_prompts = []
         batch_input_ids = []
         batch_images = []   # 每个元素是一个 study 的多视角张量 (N_view, 3, H, W)
+        batch_view_ids = []     # 每个元素：Tensor(V,) 或 None
+        batch_orient_ids = []   # 每个元素：Tensor(V,) 或 None
 
         for query in batch_queries:
             q = query["conversations"][0]["value"]
@@ -276,7 +236,57 @@ def eval_model(
                 # single = image_processor.preprocess(img, return_tensors="pt")["pixel_values"][0]
                 single = _process_image(img, image_processor)
                 image_tensor = single.unsqueeze(0)
-
+            # ==============[2026-1-2] 新增多视角选择代码==================
+            VIEW2ID = {
+                "PA": 0,
+                "AP": 1,
+                "LATERAL": 2,
+                "LAT": 2,
+            }
+            ORIENT2ID = {
+                "ERECT": 0,
+                "UPRIGHT": 0,
+                "STANDING": 0,
+                "SUPINE": 1,
+                "SEMI-ERECT": 2,
+                "SEMERECT": 2,
+            }
+            
+            def _norm_list(x):
+                if x is None:
+                    return None
+                if isinstance(x, list):
+                    return x
+                if isinstance(x, str):
+                    return [x]
+                return None
+            
+            V = int(image_tensor.shape[0])
+            
+            views = _norm_list(query.get("view", None))
+            orients = _norm_list(query.get("orientation", None))
+            
+            # view ids
+            view_id_tensor = None
+            if views is not None and len(views) == V:
+                ids = [VIEW2ID.get(str(v).upper(), -1) for v in views]
+                if all(i >= 0 for i in ids):
+                    view_id_tensor = torch.tensor(ids, dtype=torch.long, device=device)
+            
+            # orient ids (optional; can be None safely)
+            orient_id_tensor = None
+            if orients is not None and len(orients) == V:
+                ids = [ORIENT2ID.get(str(o).upper(), -1) for o in orients]
+                if all(i >= 0 for i in ids):
+                    orient_id_tensor = torch.tensor(ids, dtype=torch.long, device=device)
+            
+            # optional debug: prove we are sending ids
+            if os.environ.get("AR_CVI_DEBUG_ANCHOR", "0") == "1":
+                print(f"[EVAL][VIEW_IDS] id={query.get('id')} V={V} views={views} -> {None if view_id_tensor is None else view_id_tensor.tolist()}")
+            
+            batch_view_ids.append(view_id_tensor)
+            batch_orient_ids.append(orient_id_tensor)
+            # ==============[2026-1-2] 新增多视角选择代码==================
             batch_prompts.append(prompt)
             batch_input_ids.append(input_ids)
             batch_images.append(image_tensor)
@@ -291,6 +301,8 @@ def eval_model(
             batch_output_ids = model.generate(
                 input_ids_tensor,
                 images=batch_images,
+                view_ids=batch_view_ids,
+                orient_ids=batch_orient_ids,
                 do_sample=True if temperature > 0 else False,
                 temperature=temperature,
                 top_p=top_p,
