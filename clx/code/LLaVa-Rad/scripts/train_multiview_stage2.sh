@@ -19,13 +19,14 @@ export AR_CVI_LOG_EVERY=1024
 # ========= Stage2-A：固定主视角（需要你按第2节改代码后才生效）=========
 export AR_CVI_MATCH_BASELINE=1
 export AR_CVI_MATCH_BASELINE_TRAIN=1
-export MV_BASELINE_PICK=INDEX
+export MV_BASELINE_PICK=PA_AP_FIRST
 export MV_BASELINE_INDEX=0
 
 # ========= 注入强度：先小 =========
 export AR_CVI_DISABLE_FUSER=0
 export AR_CVI_GATE_INIT=-4
 export AR_CVI_GATE_MAX=0.2
+export AR_CVI_FORCE_REINIT=0
 
 # ========= 路由：先不学（固定主视角期）=========
 export AR_CVI_HARD=0
@@ -41,17 +42,15 @@ loader="mimic_multiview_findings"
 image_folder=/media/datasets/physionet.org/files/mimic-cxr-jpg/2.0.0/files
 
 # ====== 从 Stage1 checkpoint 权重初始化 ======
-STAGE1_DIR=/media/cuilexuan/clx/results/mv_light/biomedclip_cxr_518-mv-light-0.1e-2e-5-20251230223136
-STAGE1_CKPT="${STAGE1_DIR}/checkpoint-<xxxx>"   # 改成你实际的最后一个 checkpoint
-RAD_BASE=${STAGE1_CKPT}
+RAD_BASE="/media/cuilexuan/clx/results/mv_light/biomedclip_cxr_518-mv-light-0.2e-2e-5-20260101235441"
 
 epoch="${1:-0.3}"
 bsz="${2:-1}"
 grad_acc="${3:-16}"
 
 base_lr="2e-5"
-mm_lr="1e-5"
-ar_lr="5e-5"
+mm_lr="3e-6"
+ar_lr="3e-5"
 
 output_root="/media/cuilexuan/clx/results/mv_stage2"
 schedule="stage2A_lockAnchor-${epoch}e"
