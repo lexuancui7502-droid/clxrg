@@ -131,7 +131,7 @@ run_eval () {
 
 # 仅跑“你还没跑的”：
 run_eval "04_stage2Train_arCvi_gate02"    "ar_cvi"   0 0.2
-run_eval "05_stage2Train_arCvi_gate05"    "ar_cvi"   0 0.5
-run_eval "02_stage2Train_baselineFusion"  "baseline" 1 0.0
-run_eval "03_stage2Train_arCvi_noFuse"    "ar_cvi"   1 0.0
+# run_eval "05_stage2Train_arCvi_gate05"    "ar_cvi"   0 0.5
+# run_eval "02_stage2Train_baselineFusion"  "baseline" 1 0.0
+# run_eval "03_stage2Train_arCvi_noFuse"    "ar_cvi"   1 0.0
 
