@@ -24,7 +24,7 @@ import torch.nn as nn
 
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_projector.builder import build_vision_projector
-
+from mamba_ssm import Mamba
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
@@ -231,7 +231,6 @@ class MultiSlotFusion(nn.Module):
         self.last_cov_loss = ((p - uniform) ** 2).mean()        
 
 
-# [2025-12-14] 新增 AR-CVI 模块（证据token + 共享memory交互 + 锚点路由 + 门控融合）开始
 import torch.nn.functional as F
 
 def _downsample_grid_tokens(x: torch.Tensor, r: int) -> torch.Tensor:
@@ -248,58 +247,42 @@ def _downsample_grid_tokens(x: torch.Tensor, r: int) -> torch.Tensor:
     xds = x2d.squeeze(0).reshape(D, r * r).transpose(0, 1)  # (r*r, D)
     return xds
 
-class _CrossAttnLite(nn.Module):
+# [2026-1-7] 新增上采样模块，把 Z_PA^ds 回到原始 H*H，从而 保持 token 数量与 baseline 一致
+def _upsample_grid_tokens(x: torch.Tensor, target_n: int) -> torch.Tensor:
     """
-    Low-rank cross-attention: Q in dim -> attn_dim, K/V in dim -> attn_dim, then project back.
-    Uses scaled_dot_product_attention when available (PyTorch>=2).
+    x: (r*r, D)
+    target_n: H*H (e.g., 37*37)
+    return: (H*H, D) bilinear upsample on token grid
     """
-    def __init__(self, dim: int, attn_dim: int = 1024, num_heads: int = 8, dropout: float = 0.0):
-        super().__init__()
-        assert attn_dim % num_heads == 0
-        self.dim = dim
-        self.attn_dim = attn_dim
-        self.num_heads = num_heads
-        self.head_dim = attn_dim // num_heads
-        self.dropout = dropout
+    import torch.nn.functional as F
+    r2, D = x.shape
+    r = int(math.sqrt(r2))
+    H = int(math.sqrt(target_n))
 
-        self.q_proj = nn.Linear(dim, attn_dim, bias=False)
-        self.k_proj = nn.Linear(dim, attn_dim, bias=False)
-        self.v_proj = nn.Linear(dim, attn_dim, bias=False)
-        self.o_proj = nn.Linear(attn_dim, dim, bias=False)
+    # invalid / no-op cases
+    if r * r != r2 or H * H != target_n or r <= 0 or H <= 0 or r == H:
+        return x
 
-    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
-        """
-        q:  (B, Lq, D)
-        kv: (B, Lk, D)
-        return: (B, Lq, D)
-        """
-        B, Lq, _ = q.shape
-        _, Lk, _ = kv.shape
+    x2d = x.transpose(0, 1).reshape(D, r, r).unsqueeze(0)  # (1, D, r, r)
 
-        qh = self.q_proj(q).view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)   # (B, H, Lq, Hd)
-        kh = self.k_proj(kv).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, Lk, Hd)
-        vh = self.v_proj(kv).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2) # (B, H, Lk, Hd)
+    orig_dtype = x.dtype
+    if orig_dtype == torch.bfloat16:
+        # bf16 bilinear upsample may be unsupported; run interpolate in fp32
+        with torch.cuda.amp.autocast(enabled=False):
+            x2d = F.interpolate(x2d.float(), size=(H, H), mode="bilinear", align_corners=False)
+        x2d = x2d.to(dtype=orig_dtype)
+    else:
+        x2d = F.interpolate(x2d, size=(H, H), mode="bilinear", align_corners=False)
 
-        if hasattr(F, "scaled_dot_product_attention"):
-            out = F.scaled_dot_product_attention(
-                qh, kh, vh,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=False
-            )  # (B, H, Lq, Hd)
-        else:
-            attn = (qh @ kh.transpose(-2, -1)) / math.sqrt(self.head_dim)   # (B,H,Lq,Lk)
-            attn = attn.softmax(dim=-1)
-            if self.training and self.dropout > 0:
-                attn = F.dropout(attn, p=self.dropout)
-            out = attn @ vh  # (B,H,Lq,Hd)
+    xup = x2d.squeeze(0).reshape(D, H * H).transpose(0, 1)  # (H*H, D)
+    return xup
 
-        out = out.transpose(1, 2).contiguous().view(B, Lq, self.attn_dim)   # (B,Lq,attn_dim)
-        out = self.o_proj(out)                                              # (B,Lq,D)
-        return out
+# [2026-1-7] 新增结束
+
 
 class TokenLearnerLite(nn.Module):
     """
-    从 (N,D) patch tokens 自适应聚合出 K 个 evidence tokens。
+    从 (N,D) patch tokens 自适应聚合出 K 个 evidence tokens（压缩辅助视角信息，提取代表性“证据 token”)
     参考 TokenLearner 思想，但做成最轻量的“注意力加权求和”版本。
     """
     def __init__(self, dim: int, num_tokens: int = 16):
@@ -317,401 +300,239 @@ class TokenLearnerLite(nn.Module):
         x: (N,D)
         return: (K,D)
         """
+        orig_dtype = x.dtype
+
         xn = self.norm(x)
-        logits = self.score(xn)                  # (N,K)
-        attn = torch.softmax(logits.transpose(0, 1), dim=-1)  # (K,N)
-        tok = attn @ x                           # (K,D)
+        target_dtype = self.score.weight.dtype
+
+        if xn.dtype != target_dtype:
+            xn = xn.to(dtype=target_dtype)
+        x_cast = x if x.dtype == target_dtype else x.to(dtype=target_dtype)
+
+        if xn.is_cuda and target_dtype == torch.float32:
+            with torch.cuda.amp.autocast(enabled=False):
+                logits = self.score(xn)  # (N,K)
+                attn = torch.softmax(logits.transpose(0, 1), dim=-1)  # (K,N)
+                tok = attn @ x_cast  # (K,D)
+        else:
+            logits = self.score(xn)
+            attn = torch.softmax(logits.transpose(0, 1), dim=-1)
+            tok = attn @ x_cast
+
+        if tok.dtype != orig_dtype:
+            tok = tok.to(dtype=orig_dtype)
         return tok
 
-class SharedMemoryCVI(nn.Module):
+
+# [2026-1-7] 新增：轻量 MambaBlock + Bi-Mamba
+class MambaLiteBlock(nn.Module):
     """
-    共享 memory tokens 作为跨视角信息交换通道（Flamingo/Perceiver-resampler 的“latent通道”思想）。
-    这里不替代 patch，只用于 evidence tokens 之间的信息交换。
+    LN -> (D -> Dm) -> Mamba(Dm) -> (Dm -> D)
+    在 Deepspeed bf16 模式下强制整个 Mamba 流程使用 fp32 计算。
     """
-    def __init__(
-        self,
-        dim: int,
-        num_memory: int = 32,
-        num_layers: int = 2,
-        attn_dim: int = 1024,
-        num_heads: int = 8,
-        dropout: float = 0.0,
-        ffn_mult: int = 2,  # 保留参数以兼容旧调用，但在 bottleneck 模式下不再使用
-    ):
+    def __init__(self, dim: int, mamba_dim: int = 1024, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
-        self.num_layers = num_layers
-        self.mem = nn.Parameter(torch.randn(1, num_memory, dim) * 0.02)
 
-        self.mem_ln1 = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
-        self.mem_attn = nn.ModuleList([_CrossAttnLite(dim, attn_dim, num_heads, dropout) for _ in range(num_layers)])
-        self.mem_ln2 = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(dim)
+        self.in_proj = nn.Linear(dim, mamba_dim, bias=False)
 
-        self.evi_ln1 = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
-        self.evi_attn = nn.ModuleList([_CrossAttnLite(dim, attn_dim, num_heads, dropout) for _ in range(num_layers)])
-        self.evi_ln2 = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
-
-        # [2025-12-14] 修改 SharedMemoryCVI：将大FFN(dim->ffn_mult*dim->dim)替换为bottleneck(dim->ffn_hidden->dim)开始
-        # 说明：
-        # - 不改变 token 数、不改变 cross-attn 逻辑，只减少 FFN 参数量，显著降低 AdamW optimizer state 显存开销。
-        # - ffn_hidden 默认 1024；你可以通过环境变量 AR_CVI_FFN_HIDDEN 调整 (512/1024/2048)。
-        import os
-        ffn_hidden = int(os.environ.get("AR_CVI_FFN_HIDDEN", "1024"))
-
-        def make_bottleneck_ffn():
-            ffn = nn.Sequential(
-                nn.Linear(dim, ffn_hidden),
-                nn.GELU(),
-                nn.Linear(ffn_hidden, dim),
+        # ======= 临时强制 CPU 初始化为 float32 =======
+        prev_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float32)
+        try:
+            self.mamba = Mamba(
+                d_model=mamba_dim,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand
             )
-            # 让 FFN 初始更接近“恒等映射”，降低训练初期扰动/退化风险
-            nn.init.zeros_(ffn[-1].weight)
-            nn.init.zeros_(ffn[-1].bias)
-            return ffn
+        finally:
+            # 恢复默认 dtype（避免影响其他模块）
+            torch.set_default_dtype(prev_dtype)
+        # ============================================
 
-        self.mem_ffn = nn.ModuleList([make_bottleneck_ffn() for _ in range(num_layers)])
-        self.evi_ffn = nn.ModuleList([make_bottleneck_ffn() for _ in range(num_layers)])
-        # [2025-12-14] 修改 SharedMemoryCVI：将大FFN(dim->ffn_mult*dim->dim)替换为bottleneck(dim->ffn_hidden->dim)结束
+        self.out_proj = nn.Linear(mamba_dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        orig_dtype = x.dtype
+        is_2d = (x.dim() == 2)
+        x_in = x.unsqueeze(0) if is_2d else x  # (B,L,D)
+
+        # ---- 强制所有计算在 fp32 下 ----
+        x32 = x_in.to(torch.float32)
+
+        # LayerNorm 手动计算
+        norm_weight = self.norm.weight.to(torch.float32) if self.norm.weight is not None else None
+        norm_bias = self.norm.bias.to(torch.float32) if self.norm.bias is not None else None
+        x_norm = torch.nn.functional.layer_norm(x32, self.norm.normalized_shape, norm_weight, norm_bias, self.norm.eps)
+
+        # 线性输入
+        h = F.linear(x_norm, self.in_proj.weight.to(torch.float32), None)
+
+        # --- 关键：在每次 forward 前，强制 Mamba 参数为 float32 ---
+        for p in self.mamba.parameters():
+            if p.dtype != torch.float32:
+                p.data = p.data.float()
+
+        # Mamba 核心计算 (float32)
+        h = self.mamba(h.to(torch.float32))
+
+        # 输出线性层 (float32)
+        y32 = F.linear(h, self.out_proj.weight.to(torch.float32), None)
+
+        y = y32.to(orig_dtype)
+        return y.squeeze(0) if is_2d else y
 
 
-    def forward(self, evidence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        evidence: (V,K,D)
-        return:
-          evidence_new: (V,K,D)
-          mem_new: (M,D)
-        """
-        # [2025-12-25] 新增：eval阶段 + 禁用fuser 时，直接跳过CVI交互，防止扰动
-        if (not self.training) and os.getenv("AR_CVI_DISABLE_FUSER", "0") == "1":
-            mem_out = self.mem[0] if self.mem.dim() == 3 else self.mem  # (M,D)
-            return evidence, mem_out
-        # [2025-12-25] 新增结束
-        V, K, D = evidence.shape
-        E = evidence.reshape(1, V * K, D)              # (1, VK, D)
-        M = self.mem.expand(1, -1, -1)                 # (1, M, D)
 
-        for i in range(self.num_layers):
-            # (A) memory update: M attends to all evidence (跨视角汇聚)
-            M = M + self.mem_attn[i](self.mem_ln1[i](M), self.evi_ln1[i](E))
-            M = M + self.mem_ffn[i](self.mem_ln2[i](M))
 
-            # (B) evidence update: evidence attends to memory (跨视角广播)
-            E = E + self.evi_attn[i](self.evi_ln1[i](E), self.mem_ln1[i](M))
-            E = E + self.evi_ffn[i](self.evi_ln2[i](E))
-
-        return E.view(V, K, D), M.squeeze(0)
-
-class MemoryConditionedAnchorRouter(nn.Module):
+# 跨视角信息流建模
+class BiMambaLite(nn.Module):
     """
-    用 memory-conditioned 的方式给每个视角打分，选择“主视角锚点”。
-    关键：打分网络最后一层初始化为 0，使训练初期不扰动；再叠加可学习的 view/orient bias 作“先验暖启动”。
+    Bi-directional Mamba: forward + backward (reverse scan) then average.
     """
-    def __init__(self, dim: int, num_view_types: int = 4, num_orient_types: int = 3):
+    def __init__(self, dim: int, mamba_dim: int = 1024, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+        super().__init__()
+        self.fwd = MambaLiteBlock(dim, mamba_dim, d_state, d_conv, expand)
+        self.bwd = MambaLiteBlock(dim, mamba_dim, d_state, d_conv, expand)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (L, D)
+        """
+        y_f = self.fwd(x)
+        x_rev = torch.flip(x, dims=[0])
+        y_b_rev = self.bwd(x_rev)
+        y_b = torch.flip(y_b_rev, dims=[0])
+        return 0.5 * (y_f + y_b)
+# [2026-1-7] 新增结束
+
+# [2026-1-7] 新增两阶段融合器
+class MVGridMambaFusion(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
-        self.q_proj = nn.Linear(dim, dim // 4, bias=False)
-        self.k_proj = nn.Linear(dim, dim // 4, bias=False)
 
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim // 4),
-            nn.GELU(),
-            nn.Linear(dim // 4, 1),
-        )
-        # 训练初期 scores≈0，避免随机扰动导致锚点乱选
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        self.r = int(os.environ.get("MV_DS_R", "24"))
+        self.k = int(os.environ.get("MV_EVID_K", "16"))
 
-        # 可学习的 metadata bias（不是硬规则，参数可被学习推翻）
-        self.view_bias = nn.Embedding(num_view_types + 1, 1)    # +PAD
-        self.orient_bias = nn.Embedding(num_orient_types + 1, 1)
+        mamba_dim = int(os.environ.get("MV_MAMBA_DIM", "1024"))
+        d_state = int(os.environ.get("MV_MAMBA_DSTATE", "16"))
+        d_conv = int(os.environ.get("MV_MAMBA_DCONV", "4"))
+        expand = int(os.environ.get("MV_MAMBA_EXPAND", "2"))
 
-        # 暖启动：PA/AP/LAT 更可能是“主视角”，但这是可学习参数（非硬编码）
-        with torch.no_grad():
-            # 假设 VIEW: PA=0, AP=1, LAT=2, OTHER=3, PAD=4
-            self.view_bias.weight.zero_()
-            if num_view_types >= 3:
-                self.view_bias.weight[0] = 0.7  # PA
-                self.view_bias.weight[1] = 0.2  # AP
-                self.view_bias.weight[2] = 0.1  # LAT
-            # orient bias 默认 0
-            self.orient_bias.weight.zero_()
+        self.local = MambaLiteBlock(dim, mamba_dim, d_state, d_conv, expand)    # 对单一视角进行局部建模，用于平滑特征并提取结构信息
+        self.bi = BiMambaLite(dim, mamba_dim, d_state, d_conv, expand)          # 负责跨视角双向信息流建模，能从辅助视角向主视角蒸馏信息
+        self.token_learner = TokenLearnerLite(dim, num_tokens=self.k)           # 将每个辅助视角的下采样特征压缩为少量 K 个“证据 token”，代表该视角的主要诊断特征
 
-    def forward(
-        self,
-        evidence: torch.Tensor,   # (V,K,D)
-        mem: torch.Tensor,        # (M,D)
-        view_ids: torch.Tensor | None = None,
-        orient_ids: torch.Tensor | None = None,
-        hard: bool = True,
-        tau: float = 1.0,
-    ):
-        V, K, D = evidence.shape
+        # gate logits: sigmoid(-6) ~ 0.0025  (非常接近 0，利于贴近 baseline)
+        # self.g1_logit = nn.Parameter(torch.tensor(-6.0))
+        # self.g2_logit = nn.Parameter(torch.tensor(-6.0))
+        # gate init（对齐你原来的 AR_CVI_GATE_INIT 习惯）
+        gate_init = float(os.environ.get("MV_GATE_INIT", "-6.0"))       # 初始值设定，控制一开始注入信息的强度
+        self.g1_logit = nn.Parameter(torch.tensor(gate_init))           # 残差门控系数，控制 Stage1（局部）信息注入的强度
+        self.g2_logit = nn.Parameter(torch.tensor(gate_init))           # 残差门控系数，控制 Stage2（跨视角）信息注入的强度
 
-        # [2025-12-19] 新增硬fallback
-        # 如果没有 view_ids（mvwrap/test 很常见），必须与 baseline 一致：选第0张
-        if view_ids is None or view_ids.numel() == 0:
-            scores = evidence.new_zeros(V)
-            probs  = torch.zeros(V, device=evidence.device)
-            probs[0] = 1.0
-            entropy = torch.tensor(0.0, device=evidence.device)
-            return 0, probs, entropy, scores
-        # [2025-12-19] 新增结束
+        # hard cap
+        self.gate_max = float(os.environ.get("MV_GATE_MAX", "1.0"))
 
-        mem_q = mem.mean(dim=0)                       # (D,)
 
-        q = self.q_proj(mem_q)                        # (d,)
-        scores = []
-        for v in range(V):
-            Ev = evidence[v]                          # (K,D)
-            k = self.k_proj(Ev)                       # (K,d)
-            attn = (k @ q) / math.sqrt(k.size(-1))    # (K,)
-            attn = attn.softmax(dim=0)
-            gv = (attn.unsqueeze(-1) * Ev).sum(dim=0) # (D,)
-            sv = self.mlp(gv).squeeze(-1)             # scalar
+        # ramp：训练步数线性增长函数，使融合强度从 0 缓慢上升，避免早期扰动特征
+        self.warmup_steps = int(os.environ.get("MV_INJECT_WARMUP", "0"))
+        self.ramp_steps = int(os.environ.get("MV_INJECT_RAMP", "2000"))     # 从 warmup 结束后开始线性 ramp-up，到 ramp_steps 结束时达到最大注入强度
 
-            if view_ids is not None and v < view_ids.numel():
-                sv = sv + self.view_bias(view_ids[v]).squeeze(-1)
-            if orient_ids is not None and v < orient_ids.numel():
-                sv = sv + self.orient_bias(orient_ids[v]).squeeze(-1)
+    # 线性 ramp 函数
+    def _ramp(self, step: int) -> float:
+        if step < self.warmup_steps:
+            return 0.0
+        if self.ramp_steps <= 0:
+            return 1.0
+        t = (step - self.warmup_steps) / float(self.ramp_steps)
+        return float(max(0.0, min(1.0, t)))
 
-            scores.append(sv)
-
-        scores = torch.stack(scores, dim=0)           # (V,)
-        probs = torch.softmax(scores / max(tau, 1e-6), dim=0)
-
-        if hard and V > 1:
-            onehot = F.gumbel_softmax(scores, tau=max(tau, 1e-6), hard=True)
-            anchor_idx = int(onehot.argmax().item())
-        else:
-            anchor_idx = int(probs.argmax().item())
-
-        entropy = -(probs * (probs + 1e-8).log()).sum()
-        return anchor_idx, probs, entropy, scores
-
-class GatedAnchorFuser(nn.Module):
-    """
-    用 Cross-Attn 将“辅助证据 tokens + memory tokens”注入到“主视角全 patch tokens”里。
-    门控 gate 初始≈0：训练初期等价于只用主视角（不退化保护）。
-    """
-    def __init__(self, dim: int, attn_dim: int = 1024, num_heads: int = 8, dropout: float = 0.0):
-        super().__init__()
-        self.ln = nn.LayerNorm(dim)
-        self.attn = _CrossAttnLite(dim, attn_dim=attn_dim, num_heads=num_heads, dropout=dropout)
-
-        # [2025-12-23] 修改了：fuser 门控/尺度由环境变量控制，并支持“强制重置恒等初始化”
-        self._gate_init = float(os.getenv("AR_CVI_GATE_INIT", "-6.0"))   # 训练建议先用 -2 ~ -4，eval 可用 -6
-        self._gate_max  = float(os.getenv("AR_CVI_GATE_MAX", "1.0"))     # 训练早期建议 0.1~0.3
-        self.gate = nn.Parameter(torch.tensor(self._gate_init, dtype=torch.float32))
-        # [2025-12-23] 修改结束
-
-        # [2025-12-22] 新增，让 CrossAttn 输出在初始化时≈0（残差分支零初始化）
-        # nn.init.zeros_(self.attn.o_proj.weight)
-        # [2025-12-22] 新增结束
-
-        # [2025-12-23] 修改了：补上一个显式 reset 接口（用于防止 checkpoint 覆盖初始化）
-        self._did_force_reinit = False
-        # [2025-12-23] 修改结束
-
-        # [2025-12-25] 新增：初始化时把输出投影置零，使“未训练/强约束”更接近恒等
-        with torch.no_grad():
-            self.attn.o_proj.weight.zero_()
-
-    # [2025-12-23] 新增了 reset_to_identity，确保 fuser 回到恒等附近
-    @torch.no_grad()
-    def reset_to_identity(self):
-        # nn.init.zeros_(self.attn.o_proj.weight)
-        self.attn.o_proj.weight.zero_()
-        self.gate.fill_(self._gate_init)
-    # [2025-12-23] 新增结束
-
-    def forward(self, anchor_patches: torch.Tensor, aux_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_views: torch.Tensor, view_ids=None, global_step: int = 0) -> torch.Tensor:
         """
-        anchor_patches: (Np,D)
-        aux_tokens:     (S,D)
-        return:         (Np,D)
+        x_views: (V, Np, D)，V个视角的token特征
+        view_ids: (V,) optional, used to pick PA as anchor if possible，视角标签（如 PA/AP/Lateral）
+        return: (Np, D) fused tokens for the anchor (PA)，输出融合后主视角token
         """
-        # [2025-12-23] 修改了：支持运行时强制重置（用于你跑 Step B/B2 这类“只测结构不训练”的 sanity check）
-        if (not self._did_force_reinit) and os.getenv("AR_CVI_FORCE_REINIT", "0") == "1":
-            self.reset_to_identity()
-            self._did_force_reinit = True
-        # [2025-12-23] 修改结束
-        
-        q = self.ln(anchor_patches).unsqueeze(0)   # (1,Np,D)
-        kv = aux_tokens.unsqueeze(0)               # (1,S,D)
-        delta = self.attn(q, kv).squeeze(0)        # (Np,D)
+        V, Np, D = x_views.shape
+        H = int(math.sqrt(Np))
 
-        g = (torch.sigmoid(self.gate) * self._gate_max).to(delta.dtype)               # scalar ~0 at init
-        if (not self.training) and g.item() < 1e-5:
-            return anchor_patches
-        return anchor_patches + g * delta
-
-class ARCVIFusion(nn.Module):
-    """
-    输入：x (V,Np,D)
-    输出：fused (Np,D) —— 只把“融合后的主视角全patch”喂给 LLM（长度≈baseline）
-    """
-    def __init__(
-        self,
-        dim: int,
-        evidence_tokens: int = 16,
-        memory_tokens: int = 32,
-        cvi_layers: int = 2,
-        attn_dim: int = 1024,
-        num_heads: int = 8,
-        aux_downsample_r: int = 24,
-        dropout: float = 0.0,
-        num_view_types: int = 4,
-        num_orient_types: int = 3,
-    ):
-        super().__init__()
-        self.aux_downsample_r = aux_downsample_r
-        self.token_learner = TokenLearnerLite(dim, evidence_tokens)
-        self.cvi = SharedMemoryCVI(dim, memory_tokens, cvi_layers, attn_dim, num_heads, dropout)
-        self.router = MemoryConditionedAnchorRouter(dim, num_view_types=num_view_types, num_orient_types=num_orient_types)
-        self.fuser = GatedAnchorFuser(dim, attn_dim, num_heads, dropout)
-
-        # router 温度与是否 hard 选择（可通过环境变量调）
-        self.router_tau = float(os.environ.get("AR_CVI_TAU", "1.0"))
-        self.router_hard = (os.environ.get("AR_CVI_HARD", "1") == "1")
-
-    def forward(self, x: torch.Tensor, view_ids=None, orient_ids=None):
-        """
-        x: (V,Np,D)
-        view_ids/orient_ids: (V,)
-        """
-        V, Np, D = x.shape
-        if V <= 1:
-            fused = x[0]
-            info = {"anchor_idx": 0, "entropy": fused.new_zeros(()), "probs": fused.new_ones((1,))}
-            return fused, info
-
-        evid = []
-        for v in range(V):
-            xv = x[v]                                     # (Np,D)
-            xv_ds = _downsample_grid_tokens(xv, self.aux_downsample_r)
-            ev = self.token_learner(xv_ds)                # (K,D)
-            evid.append(ev)
-        evid = torch.stack(evid, dim=0)                   # (V,K,D)
-
-        evid, mem = self.cvi(evid)                        # cross-view interaction
-
+        # ---- 主视角选择的优先级： PA > AP > LATERAL ----
+        anchor_idx = 0
         if view_ids is not None:
-            view_ids = view_ids.to(x.device)
-        if orient_ids is not None:
-            orient_ids = orient_ids.to(x.device)
+            pa_id, ap_id, lat_id = 0, 1, 2  # 视角词表映射：PA=0, AP=1, LATERAL=2
+            pa_idx, ap_idx, lat_idx = None, None, None
 
-        # anchor_idx, probs, entropy, scores = self.router(
-        #     evid, mem, view_ids=view_ids, orient_ids=orient_ids,
-        #     hard=self.router_hard, tau=self.router_tau
-        # )
+            for i in range(V):
+                v = int(view_ids[i])
+                if v == pa_id and pa_idx is None:
+                    pa_idx = i
+                elif v == ap_id and ap_idx is None:
+                    ap_idx = i
+                elif v == lat_id and lat_idx is None:
+                    lat_idx = i
 
-        # =========================
-        # [2025-12-19] 新增eval-only: 强制 AR-CVI anchor 选择与 baseline 同构
-        # =========================
-        # [2026-1-1] 修改主视角的选择逻辑，目前固定主视角
-        match_baseline = os.environ.get("AR_CVI_MATCH_BASELINE", "0") == "1"
-        match_baseline_train = os.environ.get("AR_CVI_MATCH_BASELINE_TRAIN", "0") == "1"
-        # [2026-1-2] 新增打印节流器
-        # === DEBUG gate: 控制打印频率 & 只在 rank0 打印 ===
-        dbg = (os.environ.get("AR_CVI_DEBUG_ANCHOR", "0") == "1")
-        if dbg and int(os.environ.get("LOCAL_RANK", "0")) == 0:
-            if not hasattr(self, "_ar_cvi_dbg_step"):
-                self._ar_cvi_dbg_step = 0
-            self._ar_cvi_dbg_step += 1
-            log_every = int(os.environ.get("AR_CVI_LOG_EVERY", "1024"))
-            do_log = (log_every <= 1) or (self._ar_cvi_dbg_step % log_every == 0)
-        else:
-            do_log = False
-        # [2026-1-2] 新增结束
-        if match_baseline and ((not self.training) or match_baseline_train):
-        # [2026-1-1] 修改结束
-            pick = os.environ.get("MV_BASELINE_PICK", "INDEX").upper()
-            baseline_index = int(os.environ.get("MV_BASELINE_INDEX", "0"))
-
-            # 默认：与 baseline 一样的 INDEX/FIRST 规则
-            if pick in ("INDEX", "FIRST"):
-                anchor_idx = max(0, min(baseline_index, V - 1))
-
-            # [2026-1-1] 固定主视角选择策略
-            elif pick in ("PA_AP_FIRST", "PAAPFIRST", "FRONTAL_FIRST", "FRONTALFIRST"):
-                # 规则：PA/AP（正位）优先；都没有才选 LATERAL；再没有就 0
-                anchor_idx = 0
-                if view_ids is not None and view_ids.numel() == V:
-                    pa  = (view_ids == 0).nonzero(as_tuple=False)  # PA
-                    ap  = (view_ids == 1).nonzero(as_tuple=False)  # AP
-                    lat = (view_ids == 2).nonzero(as_tuple=False)  # LATERAL
-
-                    # 你要的是“AP/PA 优先”，这里保持确定性：PA 优先于 AP（如你想 AP 优先，把两行交换即可）
-                    if pa.numel() > 0:
-                        anchor_idx = int(pa[0].item())
-                    elif ap.numel() > 0:
-                        anchor_idx = int(ap[0].item())
-                    elif lat.numel() > 0:
-                        anchor_idx = int(lat[0].item())
-                    else:
-                        anchor_idx = 0
-            # [2026-1-1] 固定主视角选择策略结束
-
+            if pa_idx is not None:
+                anchor_idx = pa_idx
+            elif ap_idx is not None:
+                anchor_idx = ap_idx
+            elif lat_idx is not None:
+                anchor_idx = lat_idx
             else:
-                # 未知策略：保守退化到 0（保证可复现）
                 anchor_idx = 0
-            # [2026-1-2] 新增打印锚点选择日志
-            if do_log:
-                v_list = view_ids.detach().cpu().tolist() if view_ids is not None else None
-                o_list = orient_ids.detach().cpu().tolist() if orient_ids is not None else None
-                anchor_view = None
-                if view_ids is not None and view_ids.numel() == V:
-                    anchor_view = int(view_ids[anchor_idx].item())
-                print(
-                    f"[AR-CVI][branch=match_baseline][train={self.training}] "
-                    f"pick={pick} V={V} view_ids={v_list} orient_ids={o_list} "
-                    f"-> anchor_idx={anchor_idx} anchor_view={anchor_view}"
-                )
-            # [2026-1-2] 新增打印锚点选择日志结束
-            # 构造与 router 返回一致的占位输出
-            probs = x.new_zeros((V,))
-            probs[anchor_idx] = 1.0
-            entropy = x.new_zeros(())
-            scores = x.new_zeros((V,))
+                
+        # 保证模型初期仅保留baseline行为，逐步学习多视角融合
+        ramp = self._ramp(global_step)
+        g1 = ramp * torch.sigmoid(self.g1_logit)
+        g2 = ramp * torch.sigmoid(self.g2_logit)
 
+        if self.gate_max is not None:
+            cap = float(self.gate_max)
+            g1 = torch.clamp(g1, max=cap)
+            g2 = torch.clamp(g2, max=cap)
+
+        g1 = g1.to(device=x_views.device, dtype=x_views.dtype)
+        g2 = g2.to(device=x_views.device, dtype=x_views.dtype)
+
+        # -------- Stage1: view-local on downsampled grid --------
+        # 在低分辨率空间建模单视角的内部结构，减少噪声和冗余，准备跨视角融合。
+        ds_list = []
+        evid_list = []
+        for i in range(V):
+            x = x_views[i]                                  # (Np,D)
+            x_ds = _downsample_grid_tokens(x, self.r)       # (r*r,D)，调用 _downsample_grid_tokens 将每视角 H×H 网格下采样到 r×r
+            delta = self.local(x_ds) - x_ds                 # (r*r,D)，对下采样特征做 local(x_ds)
+            x_ds_tilde = x_ds + g1 * delta
+            ds_list.append(x_ds_tilde)
+
+        # aux evidences。从每个非主视角下采样结果中选出 K 个“证据 token”，表示该视角主要的病灶特征
+        for i in range(V):
+            if i == anchor_idx:
+                continue
+            evid_i = self.token_learner(ds_list[i])         # (K,D)
+            evid_list.append(evid_i)
+
+        E_aux = torch.cat(evid_list, dim=0) if len(evid_list) > 0 else None
+        X_pa = ds_list[anchor_idx]                          # (r*r,D)
+
+        # -------- Stage2: cross-view Bi-Mamba mixing --------
+        if E_aux is None:
+            Z_pa_ds = X_pa
         else:
-            # [2025-12-19] 修改，只在训练时允许“hard”
-            hard = self.router_hard and self.training
-            tau  = self.router_tau if self.training else 1.0
-            anchor_idx, probs, entropy, scores = self.router(
-                evid, mem, view_ids=view_ids, orient_ids=orient_ids,
-                hard=hard, tau=tau
-            )
-            # [2025-12-19] 修改结束
-            # [2026-1-2] 新增打印锚点选择日志
-            if do_log:
-                v_list = view_ids.detach().cpu().tolist() if view_ids is not None else None
-                o_list = orient_ids.detach().cpu().tolist() if orient_ids is not None else None
-                p_list = probs.detach().float().cpu().tolist() if probs is not None else None
-                s_list = scores.detach().float().cpu().tolist() if scores is not None else None
-                print(
-                    f"[AR-CVI][branch=router][train={self.training}] "
-                    f"hard={hard} tau={tau} V={V} view_ids={v_list} orient_ids={o_list} "
-                    f"-> anchor_idx={int(anchor_idx)} probs={p_list} scores={s_list}"
-                )
-            # [2026-1-2] 新增打印锚点选择日志结束
-        # [2025-12-19] 新增eval-only结束: 强制 AR-CVI anchor 选择与 baseline 同构
+            S = torch.cat([E_aux, X_pa], dim=0)            # (K_aux + r*r, D)，拼接序列
+            S2 = self.bi(S)                                # (same)，经 BiMambaLite 进行正反向状态混合
+            Z_pa_ds = S2[-(self.r * self.r):]              # only keep PA grid tokens，仅保留最后 r×r 个 token（主视角的融合结果）
 
-        # ====== [2025-12-22] 新增：eval-only，禁用融合注入，只看“选主视角”本身影响 ======
-        if (not self.training) and (os.environ.get("AR_CVI_DISABLE_FUSER", "0") == "1"):
-            fused = x[anchor_idx]
-            info = {"anchor_idx": anchor_idx, "entropy": entropy, "probs": probs, "scores": scores}
-            return fused, info
-        # ====== [2025-12-22] 新增结束 ========
+        # upsample back to H*H and gated-inject to keep baseline token count
+        Z_up = _upsample_grid_tokens(Z_pa_ds, target_n=H * H)  # (Np,D)，将 r×r 网格恢复为 H×H
+        X_anchor_full = x_views[anchor_idx]                    # (Np,D)
 
-        aux_list = [evid[i] for i in range(V) if i != anchor_idx]
-        aux_tokens = torch.cat(aux_list + [mem], dim=0)   # ( (V-1)*K + M, D )
-
-        fused = self.fuser(x[anchor_idx], aux_tokens)     # (Np,D)
-
-        info = {"anchor_idx": anchor_idx, "entropy": entropy, "probs": probs, "scores": scores}
-        return fused, info
-# [2025-12-14] 新增 AR-CVI 模块（证据token + 共享memory交互 + 锚点路由 + 门控融合）结束
+        out = X_anchor_full + g2 * (Z_up - X_anchor_full)
+        return out
+# [2026-1-7] 新增结束
 
 
 # 这个类定义了多模态基础模型，结合视觉编码器和语言模型
@@ -875,17 +696,6 @@ class LlavaMetaForCausalLM(ABC):
                 attention_mask = torch.ones((attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1), dtype=attention_mask.dtype, device=attention_mask.device)
             return input_ids, attention_mask, past_key_values, None, labels             # 继续进行多模态处理
 
-        # 图像特征提取和分块
-        # if type(images) is list or images.ndim == 5:        # 如果输入是图像列表或5维张量，则拼接所有图像 → 批量编码 → 按原始批次分割 → 展平特征
-        #     # 处理多个图像样本
-        #     concat_images = torch.cat([image for image in images], dim=0)       
-        #     image_features = self.encode_images(concat_images)
-        #     split_sizes = [image.shape[0] for image in images]
-        #     image_features = torch.split(image_features, split_sizes, dim=0)
-        #     image_features = [x.flatten(0, 1) for x in image_features]
-        # else:
-        #     # 处理单个图像批次
-        #     image_features = self.encode_images(images)
 
         if isinstance(images, list) or (isinstance(images, torch.Tensor) and images.ndim == 5):
             # 统一成 list[Tensor(N_view, 3, H, W)]
@@ -895,7 +705,7 @@ class LlavaMetaForCausalLM(ABC):
                 image_list = images                    # list[B] of (V,3,H,W)
 
             model = self.get_model()
-            mv_fusion = os.environ.get("MV_FUSION", getattr(model, "mv_fusion", "ar_cvi")).lower()
+            mv_fusion = os.environ.get("MV_FUSION", getattr(model, "mv_fusion", "baseline")).lower()
 
             # =========================================================
             # [STRICT BASELINE] 先选定每个 study 的一张图，再走单视角 encode
@@ -959,7 +769,7 @@ class LlavaMetaForCausalLM(ABC):
                 self._last_slot_cov_loss = None
 
             # =========================================================
-            # [MULTIVIEW PATH] ar_cvi / 其他多视角融合
+            # [MULTIVIEW PATH] 其他多视角融合
             # =========================================================
             else:
                 concat_images = torch.cat(image_list, dim=0)      # (sum_V,3,H,W)
@@ -979,43 +789,16 @@ class LlavaMetaForCausalLM(ABC):
                     v_ids = view_ids_list[b][:V] if view_ids_list[b] is not None else None
                     o_ids = orient_ids_list[b][:V] if orient_ids_list[b] is not None else None
 
-                    if mv_fusion == "ar_cvi":
-                        ar_cvi = getattr(model, "ar_cvi", None)
-                        if ar_cvi is None:
-                            raise RuntimeError("ar_cvi is not found on core model; please init it in LlavaLlamaModel.__init__.")
+                    # [2026-1-7] 新增mamba_grid分支
+                    if mv_fusion == "mamba_grid":
+                        mv = getattr(model, "mv_grid_mamba", None)
+                        if mv is None:
+                            raise RuntimeError("mv_grid_mamba is not found on core model; please init it in LlavaLlamaModel.__init__.")
 
-                        fused_patches, info = ar_cvi(x, view_ids=v_ids, orient_ids=o_ids)
-
-                        # 统计 anchor（确保 counter 初始化）
-                        if os.environ.get("AR_CVI_LOG_ANCHOR", "0") == "1" and info is not None and "anchor_idx" in info:
-                            from collections import Counter
-                            import torch.distributed as dist
-
-                            if not hasattr(self, "_ar_cvi_anchor_counter"):
-                                self._ar_cvi_anchor_counter = Counter()
-                                self._ar_cvi_anchor_total = 0
-
-                            anchor_idx = info["anchor_idx"]
-                            if torch.is_tensor(anchor_idx):
-                                anchor_idx = anchor_idx.detach().flatten()
-                                a = int(anchor_idx.item()) if anchor_idx.numel() == 1 else int(torch.mode(anchor_idx).values.item())
-                            elif isinstance(anchor_idx, (list, tuple)):
-                                a = int(max(set(anchor_idx), key=anchor_idx.count))
-                            else:
-                                a = int(anchor_idx)
-
-                            key = int(v_ids[a].item()) if v_ids is not None else a
-                            self._ar_cvi_anchor_counter[key] += 1
-                            self._ar_cvi_anchor_total += 1
-
-                            log_every = int(os.environ.get("AR_CVI_LOG_EVERY", "512"))
-                            is_rank0 = (not dist.is_available()) or (not dist.is_initialized()) or (dist.get_rank() == 0)
-                            if is_rank0 and (self._ar_cvi_anchor_total % log_every == 0):
-                                print(f"[AR-CVI] anchor_counter (n={self._ar_cvi_anchor_total}): {dict(self._ar_cvi_anchor_counter)}")
-
+                        step = int(getattr(model, "_mv_global_step", 0))  # 注意：写在 model 上更稳
+                        fused_patches = mv(x, view_ids=v_ids, global_step=step)  # x: (V,Np,D) -> (Np,D)
                         fused_features.append(fused_patches)
-                        if info is not None and "entropy" in info:
-                            router_ent_losses.append(info["entropy"])
+                    # [20026-1-7] 新增结束
                     else:
                         raise RuntimeError(f"Unknown MV_FUSION={mv_fusion}")
 

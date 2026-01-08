@@ -31,7 +31,8 @@ from ..llava_arch import (
     LlavaMetaModel,
     LlavaMetaForCausalLM,
     SimpleViewAttention,
-    ARCVIFusion,          # [2025-12-14] 新增
+    # ARCVIFusion,          # [2025-12-14] 新增
+    MVGridMambaFusion,   # [2026-1-7] 新增
 )
 
 
@@ -56,29 +57,36 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):                  # 组合视�
         self.chexpert_lambda = float(os.environ.get("CHEXPERT_LAMBDA", "0.1"))
 
         # === AR-CVI 配置（都有默认值，保证可跑）===
-        self.mv_fusion = os.environ.get("MV_FUSION", "ar_cvi")
+        # self.mv_fusion = os.environ.get("MV_FUSION", "ar_cvi")
 
-        evidence_tokens = int(os.environ.get("AR_CVI_EVID", str(getattr(config, "ar_cvi_evid", 16))))
-        memory_tokens   = int(os.environ.get("AR_CVI_MEM",  str(getattr(config, "ar_cvi_mem", 32))))
-        cvi_layers      = int(os.environ.get("AR_CVI_LAYERS", str(getattr(config, "ar_cvi_layers", 2))))
-        attn_dim        = int(os.environ.get("AR_CVI_ATTN_DIM", str(getattr(config, "ar_cvi_attn_dim", 1024))))
-        aux_r           = int(os.environ.get("AR_CVI_AUX_R", str(getattr(config, "ar_cvi_aux_r", 24))))
+        # [2026-1-7] 新增初始化mv_grid_mamba
+        self.mv_fusion = os.environ.get("MV_FUSION", "baseline").lower()
 
-        num_view_types  = getattr(config, "num_view_types", 4)
-        num_orient_types= getattr(config, "num_orient_types", 3)
+        if self.mv_fusion == "mamba_grid":
+            self.mv_grid_mamba = MVGridMambaFusion(dim=dim)
+        # [2026-1-7] 新增结束
 
-        self.ar_cvi = ARCVIFusion(
-            dim=dim,
-            evidence_tokens=evidence_tokens,
-            memory_tokens=memory_tokens,
-            cvi_layers=cvi_layers,
-            attn_dim=attn_dim,
-            num_heads=8,
-            aux_downsample_r=aux_r,
-            dropout=0.0,
-            num_view_types=num_view_types,
-            num_orient_types=num_orient_types,
-        )
+        # evidence_tokens = int(os.environ.get("AR_CVI_EVID", str(getattr(config, "ar_cvi_evid", 16))))
+        # memory_tokens   = int(os.environ.get("AR_CVI_MEM",  str(getattr(config, "ar_cvi_mem", 32))))
+        # cvi_layers      = int(os.environ.get("AR_CVI_LAYERS", str(getattr(config, "ar_cvi_layers", 2))))
+        # attn_dim        = int(os.environ.get("AR_CVI_ATTN_DIM", str(getattr(config, "ar_cvi_attn_dim", 1024))))
+        # aux_r           = int(os.environ.get("AR_CVI_AUX_R", str(getattr(config, "ar_cvi_aux_r", 24))))
+
+        # num_view_types  = getattr(config, "num_view_types", 4)
+        # num_orient_types= getattr(config, "num_orient_types", 3)
+
+        # self.ar_cvi = ARCVIFusion(
+        #     dim=dim,
+        #     evidence_tokens=evidence_tokens,
+        #     memory_tokens=memory_tokens,
+        #     cvi_layers=cvi_layers,
+        #     attn_dim=attn_dim,
+        #     num_heads=8,
+        #     aux_downsample_r=aux_r,
+        #     dropout=0.0,
+        #     num_view_types=num_view_types,
+        #     num_orient_types=num_orient_types,
+        # )
     # [2025-12-14] 修改 LlavaLlamaModel.__init__：移除 slot+gate，改为初始化 AR-CVI 结束
 
 # 语言生成模型，负责端到端的训练和推理。继承自 LlamaForCausalLM（纯文本生成模型）和 LlavaMetaForCausalLM（多模态支持）

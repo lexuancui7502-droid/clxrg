@@ -195,7 +195,7 @@ class LLaVATrainer(Trainer):
 
 from transformers.optimization import get_scheduler
 
-# [2025-12-23] 修改了：自定义 Trainer，给 mm_projector / ar_cvi 分配不同学习率
+# [2025-12-23] 修改了：自定义 Trainer，给 mm_projector / mv_grid_mamba 分配不同学习率
 class _MVTrainer(LLaVATrainer):
     def create_optimizer(self):
         if self.optimizer is not None:
@@ -204,7 +204,7 @@ class _MVTrainer(LLaVATrainer):
         args = self.args
         base_lr = args.learning_rate
         mm_lr = args.mm_projector_lr if args.mm_projector_lr is not None else base_lr
-        ar_lr = args.ar_cvi_lr if args.ar_cvi_lr is not None else base_lr
+        mamba_lr = args.mamba_lr if getattr(args, "mamba_lr", None) is not None else base_lr
 
         decay_parameters = get_parameter_names(self.model, [torch.nn.LayerNorm])
         decay_parameters = [n for n in decay_parameters if "bias" not in n]
@@ -212,8 +212,9 @@ class _MVTrainer(LLaVATrainer):
         def pick_lr(n: str) -> float:
             if "mm_projector" in n:
                 return mm_lr
-            if "ar_cvi" in n:
-                return ar_lr
+            if "mv_grid_mamba" in n or "mamba" in n:
+                # 独立的 Mamba 学习率
+                return getattr(args, "mamba_lr", None) or base_lr
             return base_lr
 
         buckets = {}  # (lr, wd) -> param group
@@ -276,3 +277,14 @@ class _MVTrainer(LLaVATrainer):
                 logs[f"lr/group_{i}"] = g.get("lr", None)
         return super().log(logs)
     # [2025-12-27] 新增结束
+
+    # [2026-1-7] 新增
+    def training_step(self, model, inputs):
+        # 将 global_step 写到 core model 上，供 MVGridMambaFusion 做 ramp
+        core = model.module if hasattr(model, "module") else model
+        if hasattr(core, "get_model"):
+            core.get_model()._mv_global_step = int(self.state.global_step)
+        else:
+            core._mv_global_step = int(self.state.global_step)
+        return super().training_step(model, inputs)
+    # [2026-1-7] 新增结束

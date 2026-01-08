@@ -139,10 +139,18 @@ class TrainingArguments(transformers.TrainingArguments):  # 扩展 HF 的 Traini
         default=None,
         metadata={"help": "Learning rate for mm_projector (override base lr)."}
     )
-    ar_cvi_lr: Optional[float] = field(
+    # ar_cvi_lr: Optional[float] = field(
+    #     default=None,
+    #     metadata={"help": "Learning rate for ar_cvi (override base lr)."}
+    # )
+
+    # [2026-1-7] 新增Mamba字段
+    mamba_lr: Optional[float] = field(
         default=None,
-        metadata={"help": "Learning rate for ar_cvi (override base lr)."}
+        metadata={"help": "Learning rate for Mamba fusion (MVGridMambaFusion)."}
     )
+    # [2026-1-7] 新增结束
+
     # [2025-12-23] 新增结束
     # LoRA 相关参数
     lora_enable: bool = False  # 是否启用 LoRA（Low-Rank Adaptation），默认为 False
@@ -236,11 +244,11 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
     # 多模态适配器微调保存。当只微调多模态MLP适配器时，只保存适配器相关参数，而不是整个模型
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
-        # [2025-12-25] 修改：tune_mm_mlp_adapter 保存时，keys_to_match 统一为“并集”，兼容有/无 vision_resampler，并确保 AR-CVI 等模块不会在 checkpoint 路径丢失 开始
+        # [2025-12-25] 修改：tune_mm_mlp_adapter 保存时，keys_to_match 统一为“并集”，兼容有/无 vision_resampler，并确保 Mamba 等模块不会在 checkpoint 路径丢失 开始
         # 说明：
         # - vision_resampler：如果模型里不存在该模块，get_mm_adapter_state_maybe_zero_3 匹配不到会自动忽略，不会报错
         # - 仍保持文件名 mm_projector.bin / checkpoint-xxx.bin 不变，避免破坏你当前的加载逻辑
-        keys_to_match = ['mm_projector', 'vision_resampler', 'ar_cvi', 'disease_head']
+        keys_to_match = ['mm_projector', 'vision_resampler', 'mv_grid_mamba', 'disease_head']
         # [2025-12-25] 修改结束
     
         if getattr(trainer.args, "use_im_start_end", False):
@@ -1068,9 +1076,9 @@ def train():
         for _, p in model.named_parameters():
             p.requires_grad_(False)
 
-        # 1) 解冻 AR-CVI（你的新模块）
-        if hasattr(core, "ar_cvi"):
-            core.ar_cvi.requires_grad_(True)
+        # 1) 解冻 MVGridMamba（你的新模块）
+        if hasattr(core, "mv_grid_mamba"):
+            core.mv_grid_mamba.requires_grad_(True)
 
         # 2) 视图级模块（如你仍希望训练）
         if hasattr(core, "view_attn"):
@@ -1243,8 +1251,8 @@ def train():
     # [2025-12-23] 新增：调试打印必须放在“最后一次 apply_freeze_policy 之后”，否则你看到的并不是真实训练集合
     core = model.get_model()
     train_modules = []
-    if hasattr(core, "ar_cvi") and any(p.requires_grad for p in core.ar_cvi.parameters()):
-        train_modules.append("ar_cvi")
+    if hasattr(core, "mv_grid_mamba") and any(p.requires_grad for p in core.mv_grid_mamba.parameters()):
+        train_modules.append("mv_grid_mamba")
     if hasattr(core, "view_attn") and any(p.requires_grad for p in core.view_attn.parameters()):
         train_modules.append("view_attn")
     if hasattr(core, "mm_projector") and any(p.requires_grad for p in core.mm_projector.parameters()):
