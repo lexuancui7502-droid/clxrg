@@ -396,6 +396,18 @@ class BiMambaLite(nn.Module):
         super().__init__()
         self.fwd = MambaLiteBlock(dim, mamba_dim, d_state, d_conv, expand)
         self.bwd = MambaLiteBlock(dim, mamba_dim, d_state, d_conv, expand)
+        
+        # [2026-1-9] 新增：Bi-Mamba forward/backward 融合改为 concat + proj
+        # 目的：避免 y_f 与 y_b 直接相加造成信息抵消；让融合方式可学习（更接近 BiLSTM 的标准做法）
+        self.fuse_proj = nn.Linear(2 * dim, dim, bias=False)
+
+        # [2026-1-9] 初始化为“等价于平均”的近似恒等融合，保证训练初期行为与原来 0.5*(y_f+y_b) 尽量一致、稳定
+        with torch.no_grad():
+            self.fuse_proj.weight.zero_()
+            idx = torch.arange(dim)
+            self.fuse_proj.weight[idx, idx] = 0.5
+            self.fuse_proj.weight[idx, idx + dim] = 0.5
+        # [2026-1-9] 新增结束
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -405,7 +417,13 @@ class BiMambaLite(nn.Module):
         x_rev = torch.flip(x, dims=[0])
         y_b_rev = self.bwd(x_rev)
         y_b = torch.flip(y_b_rev, dims=[0])
-        return 0.5 * (y_f + y_b)
+        # return 0.5 * (y_f + y_b)
+        # [2026-1-9] 修改：concat + proj 融合
+        y = torch.cat([y_f, y_b], dim=-1)  # (L, 2D)
+        y = self.fuse_proj(y)             # (L, D)
+        return y
+        # [2026-1-9] 修改结束
+
 # [2026-1-7] 新增结束
 
 # [2026-1-7] 新增两阶段融合器
@@ -426,6 +444,19 @@ class MVGridMambaFusion(nn.Module):
         self.bi = BiMambaLite(dim, mamba_dim, d_state, d_conv, expand)          # 负责跨视角双向信息流建模，能从辅助视角向主视角蒸馏信息
         self.token_learner = TokenLearnerLite(dim, num_tokens=self.k)           # 将每个辅助视角的下采样特征压缩为少量 K 个“证据 token”，代表该视角的主要诊断特征
 
+        # [2026-1-9] 新增：显式 segment(view/type) embedding
+        # token_type: 0=aux evidence tokens, 1=anchor(PA/AP/Lat) grid tokens
+        self.seg_embed = nn.Embedding(2, dim)
+
+        # view embedding：用于区分 aux 来自哪个视角；默认给一个上限（MIMIC-CXR 多视角常见 3 类：PA/AP/Lateral）
+        self.num_views = int(os.environ.get("MV_NUM_VIEWS", "8"))
+        self.view_embed = nn.Embedding(self.num_views, dim)
+
+        # 初始化为 0：不在训练初期引入额外扰动（配合你 gate/ramp 的“恒等保护”哲学）
+        nn.init.zeros_(self.seg_embed.weight)
+        nn.init.zeros_(self.view_embed.weight)
+        # [2026-1-9] 新增结束
+
         # gate logits: sigmoid(-6) ~ 0.0025  (非常接近 0，利于贴近 baseline)
         # self.g1_logit = nn.Parameter(torch.tensor(-6.0))
         # self.g2_logit = nn.Parameter(torch.tensor(-6.0))
@@ -439,7 +470,7 @@ class MVGridMambaFusion(nn.Module):
 
 
         # ramp：训练步数线性增长函数，使融合强度从 0 缓慢上升，避免早期扰动特征
-        self.warmup_steps = int(os.environ.get("MV_INJECT_WARMUP", "0"))
+        self.warmup_steps = int(os.environ.get("MV_INJECT_WARMUP", "0"))    # 前 warmup_steps 步骤内不注入任何多视角信息
         self.ramp_steps = int(os.environ.get("MV_INJECT_RAMP", "2000"))     # 从 warmup 结束后开始线性 ramp-up，到 ramp_steps 结束时达到最大注入强度
 
     # 线性 ramp 函数
@@ -460,42 +491,60 @@ class MVGridMambaFusion(nn.Module):
         V, Np, D = x_views.shape
         H = int(math.sqrt(Np))
 
-        # ---- 主视角选择的优先级： PA > AP > LATERAL ----
-        anchor_idx = 0
-        if view_ids is not None:
-            pa_id, ap_id, lat_id = 0, 1, 2  # 视角词表映射：PA=0, AP=1, LATERAL=2
-            pa_idx, ap_idx, lat_idx = None, None, None
+        # -------------------------
+        # (1) 统一的 anchor 选择逻辑：完全对齐 baseline 语义
+        # -------------------------
+        pick = os.environ.get("MV_BASELINE_PICK", "PA_AP_FIRST").upper()
 
-            for i in range(V):
-                v = int(view_ids[i])
-                if v == pa_id and pa_idx is None:
-                    pa_idx = i
-                elif v == ap_id and ap_idx is None:
-                    ap_idx = i
-                elif v == lat_id and lat_idx is None:
-                    lat_idx = i
+        if pick == "INDEX":
+            anchor_idx = int(os.environ.get("MV_BASELINE_INDEX", "0"))
+            anchor_idx = max(0, min(anchor_idx, V - 1))
+        else:
+            # PA_AP_FIRST：优先 PA，否则 AP，否则 LATERAL，否则 0
+            anchor_idx = 0
+            if view_ids is not None:
+                v = view_ids.tolist() if torch.is_tensor(view_ids) else list(view_ids)
+                if 0 in v:        # PA=0
+                    anchor_idx = v.index(0)
+                elif 1 in v:      # AP=1
+                    anchor_idx = v.index(1)
+                elif 2 in v:      # LATERAL=2
+                    anchor_idx = v.index(2)
+                else:
+                    anchor_idx = 0
 
-            if pa_idx is not None:
-                anchor_idx = pa_idx
-            elif ap_idx is not None:
-                anchor_idx = ap_idx
-            elif lat_idx is not None:
-                anchor_idx = lat_idx
-            else:
-                anchor_idx = 0
+        # -------------------------
+        # (2) gate cap：优先 env，其次 self.gate_max
+        # -------------------------
+        gate_cap = float(os.environ.get("MV_GATE_MAX", str(self.gate_max)))  # 保留你现在的动态覆盖习惯也行
+
+        # -------------------------
+        # (3) 检查 1 的关键：硬关死（gate==0）必须“直接返回 anchor patch”
+        # -------------------------
+        if gate_cap <= 0.0:
+            if os.environ.get("MV_DEBUG_ANCHOR", "0") == "1":
+                print(f"[MV][gate0] V={V} pick={pick} anchor_idx={anchor_idx}", flush=True)
+            return x_views[anchor_idx]
+        
                 
         # 保证模型初期仅保留baseline行为，逐步学习多视角融合
         ramp = self._ramp(global_step)
         g1 = ramp * torch.sigmoid(self.g1_logit)
         g2 = ramp * torch.sigmoid(self.g2_logit)
 
-        if self.gate_max is not None:
-            cap = float(self.gate_max)
-            g1 = torch.clamp(g1, max=cap)
-            g2 = torch.clamp(g2, max=cap)
+        g1 = torch.clamp(g1, max=gate_cap)
+        g2 = torch.clamp(g2, max=gate_cap)
 
         g1 = g1.to(device=x_views.device, dtype=x_views.dtype)
         g2 = g2.to(device=x_views.device, dtype=x_views.dtype)
+
+        # [2026-1-9] 新增：将 view_ids 规范化为 LongTensor（用于 view embedding）
+        # 注意：view_ids 可能是 list/np.ndarray/torch.Tensor，这里统一成 torch.LongTensor
+        if view_ids is not None:
+            view_ids_t = torch.as_tensor(view_ids, device=x_views.device, dtype=torch.long)
+        else:
+            view_ids_t = None
+        # [2026-1-9] 新增结束
 
         # -------- Stage1: view-local on downsampled grid --------
         # 在低分辨率空间建模单视角的内部结构，减少噪声和冗余，准备跨视角融合。
@@ -513,22 +562,49 @@ class MVGridMambaFusion(nn.Module):
             if i == anchor_idx:
                 continue
             evid_i = self.token_learner(ds_list[i])         # (K,D)
+
+            # [2026-1-9] 新增：aux evidence tokens 加上显式 segment(view/type) embedding
+            # seg=0 表示 aux evidence；view_id 用于区分来源视角（若缺失则默认为 0）
+            seg_aux = self.seg_embed.weight[0].to(dtype=evid_i.dtype, device=evid_i.device)
+            
+            if view_ids_t is not None:
+                vid = int(view_ids_t[i].item()) % self.num_views
+            else:
+                vid = 0
+            view_e = self.view_embed.weight[vid].to(dtype=evid_i.dtype, device=evid_i.device)
+            
+            evid_i = evid_i + seg_aux + view_e
+            # [2026-1-9] 新增结束
+
             evid_list.append(evid_i)
 
         E_aux = torch.cat(evid_list, dim=0) if len(evid_list) > 0 else None
-        X_pa = ds_list[anchor_idx]                          # (r*r,D)
+        X_anchor = ds_list[anchor_idx]                               # (r*r,D)
+
+        # [2026-1-9] 新增：anchor grid tokens 加上显式 segment(view/type) embedding
+        # seg=1 表示 anchor grid；view_id 用 anchor 的视角 id（PA/AP/Lateral）
+        seg_pa = self.seg_embed.weight[1].to(dtype=X_anchor.dtype, device=X_anchor.device)
+
+        if view_ids_t is not None:
+            anchor_vid = int(view_ids_t[anchor_idx].item()) % self.num_views
+        else:
+            anchor_vid = 0
+        view_pa = self.view_embed.weight[anchor_vid].to(dtype=X_anchor.dtype, device=X_anchor.device)
+
+        X_anchor = X_anchor + seg_pa + view_pa
+        # [2026-1-9] 新增结束
 
         # -------- Stage2: cross-view Bi-Mamba mixing --------
         if E_aux is None:
-            Z_pa_ds = X_pa
+            Z_anchor_ds = X_anchor
         else:
-            S = torch.cat([E_aux, X_pa], dim=0)            # (K_aux + r*r, D)，拼接序列
+            S = torch.cat([E_aux, X_anchor], dim=0)            # (K_aux + r*r, D)，拼接序列
             S2 = self.bi(S)                                # (same)，经 BiMambaLite 进行正反向状态混合
-            Z_pa_ds = S2[-(self.r * self.r):]              # only keep PA grid tokens，仅保留最后 r×r 个 token（主视角的融合结果）
+            Z_anchor_ds = S2[-(self.r * self.r):]              # only keep anchor grid tokens，仅保留最后 r×r 个 token（主视角的融合结果）
 
         # upsample back to H*H and gated-inject to keep baseline token count
-        Z_up = _upsample_grid_tokens(Z_pa_ds, target_n=H * H)  # (Np,D)，将 r×r 网格恢复为 H×H
-        X_anchor_full = x_views[anchor_idx]                    # (Np,D)
+        Z_up = _upsample_grid_tokens(Z_anchor_ds, target_n=H * H)  # (Np,D)，将 r×r 网格恢复为 H×H
+        X_anchor_full = x_views[anchor_idx]                         # (Np,D)
 
         out = X_anchor_full + g2 * (Z_up - X_anchor_full)
         return out

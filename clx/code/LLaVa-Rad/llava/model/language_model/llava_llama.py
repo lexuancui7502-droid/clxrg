@@ -49,7 +49,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):                  # 组合视�
         dim = config.hidden_size
 
         # 可保留（如果你还想做 view-level 的轻量加权/对齐）
-        self.view_attn = SimpleViewAttention(dim=dim)
+        # self.view_attn = SimpleViewAttention(dim=dim)
 
         # [2025-12-12] 疾病预测头保持不变
         self.num_diseases = 14
@@ -64,6 +64,8 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):                  # 组合视�
 
         if self.mv_fusion == "mamba_grid":
             self.mv_grid_mamba = MVGridMambaFusion(dim=dim)
+        if self.mv_fusion in ["view_attn", "slot"]:   # 目前你没有这些分支，仅保留“未来可能性”
+            self.view_attn = SimpleViewAttention(dim=dim)
         # [2026-1-7] 新增结束
 
         # evidence_tokens = int(os.environ.get("AR_CVI_EVID", str(getattr(config, "ar_cvi_evid", 16))))
