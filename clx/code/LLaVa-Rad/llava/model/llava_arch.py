@@ -135,7 +135,6 @@ class MultiSlotFusion(nn.Module):
 
         V, L, D = x.shape
         device = x.device
-
         # ------ 1) 加视角 / 体位 embedding ------
         # if view_ids is not None:
         #     view_ids = view_ids.to(device)
@@ -254,7 +253,6 @@ def _upsample_grid_tokens(x: torch.Tensor, target_n: int) -> torch.Tensor:
     target_n: H*H (e.g., 37*37)
     return: (H*H, D) bilinear upsample on token grid
     """
-    import torch.nn.functional as F
     r2, D = x.shape
     r = int(math.sqrt(r2))
     H = int(math.sqrt(target_n))
@@ -538,13 +536,28 @@ class MVGridMambaFusion(nn.Module):
         g1 = g1.to(device=x_views.device, dtype=x_views.dtype)
         g2 = g2.to(device=x_views.device, dtype=x_views.dtype)
 
-        # [2026-1-9] 新增：将 view_ids 规范化为 LongTensor（用于 view embedding）
-        # 注意：view_ids 可能是 list/np.ndarray/torch.Tensor，这里统一成 torch.LongTensor
+        # [2026-1-20 强制修正] 处理 view_ids，防止 Embedding 越界崩溃
         if view_ids is not None:
             view_ids_t = torch.as_tensor(view_ids, device=x_views.device, dtype=torch.long)
+            
+            # 打印一次 debug 信息 (仅 rank0, 仅 step 0) 确认是否生效
+            if global_step == 0 and os.environ.get("LOCAL_RANK", "0") == "0":
+                print(f"[DEBUG] view_ids check: min={view_ids_t.min()}, max={view_ids_t.max()}, limit={self.num_views}")
+
+            # ★★★ 核心修复：强制钳位到 [0, num_views-1] ★★★
+            # 你的 num_views 默认是 8，如果数据里有更大的 ID，不 clamp 就会导致 CUDA 报错
+            view_ids_t = view_ids_t.clamp(0, self.num_views - 1)
         else:
             view_ids_t = None
-        # [2026-1-9] 新增结束
+
+        # [2026-1-19] DEBUG & SAFETY: 确保 view_ids 不越界
+        if view_ids_t is not None:
+            # 打印一次 debug 信息 (仅 rank0, 仅 step 0)
+            if global_step == 0 and os.environ.get("LOCAL_RANK", "0") == "0":
+                print(f"[DEBUG] view_ids range: min={view_ids_t.min()}, max={view_ids_t.max()}, num_views={self.num_views}")
+            
+            # 强制钳位，防止 Embedding 越界崩溃
+            view_ids_t = view_ids_t.clamp(0, self.num_views - 1)
 
         # -------- Stage1: view-local on downsampled grid --------
         # 在低分辨率空间建模单视角的内部结构，减少噪声和冗余，准备跨视角融合。
@@ -568,7 +581,7 @@ class MVGridMambaFusion(nn.Module):
             seg_aux = self.seg_embed.weight[0].to(dtype=evid_i.dtype, device=evid_i.device)
             
             if view_ids_t is not None:
-                vid = int(view_ids_t[i].item()) % self.num_views
+                vid = int(view_ids_t[i].item())
             else:
                 vid = 0
             view_e = self.view_embed.weight[vid].to(dtype=evid_i.dtype, device=evid_i.device)
@@ -585,10 +598,12 @@ class MVGridMambaFusion(nn.Module):
         # seg=1 表示 anchor grid；view_id 用 anchor 的视角 id（PA/AP/Lateral）
         seg_pa = self.seg_embed.weight[1].to(dtype=X_anchor.dtype, device=X_anchor.device)
 
+        # [修正] 增加 None 检查，防止 inference 时未传 view_ids 导致崩溃
         if view_ids_t is not None:
-            anchor_vid = int(view_ids_t[anchor_idx].item()) % self.num_views
+            anchor_vid = int(view_ids_t[anchor_idx].item())
         else:
             anchor_vid = 0
+            
         view_pa = self.view_embed.weight[anchor_vid].to(dtype=X_anchor.dtype, device=X_anchor.device)
 
         X_anchor = X_anchor + seg_pa + view_pa
@@ -699,7 +714,7 @@ class LlavaMetaForCausalLM(ABC):
     #     return image_features               # 返回投影后的图像特征
 
     # [2025-11-18] 统一处理图像 -> 视觉塔 -> 投影器 的 dtype / device
-    def encode_images(self, images):
+    def encode_images(self, images, view_ids=None, findings_embeds=None):
         """
         统一处理图像 -> 视觉塔 -> 投影器 的 dtype / device，
         避免 mat1 / mat2 dtype 不一致的问题。
@@ -709,7 +724,6 @@ class LlavaMetaForCausalLM(ABC):
         projector = model.mm_projector
 
         # 1. 把图片丢到视觉塔所在的 device / dtype 上
-        #    （防止出现 images 在 CPU、vision_tower 在 CUDA 之类的问题）
         vt_params = list(vision_tower.parameters())
         if len(vt_params) > 0:
             vt_device = vt_params[0].device
@@ -733,7 +747,6 @@ class LlavaMetaForCausalLM(ABC):
             image_features = vision_tower(images)
         # [2025-12-14] 修改 encode_images：冻结 vision_tower 时用 no_grad 降显存 结束
 
-
         # 3. 再把特征 cast 到 projector 的 dtype 上
         proj_params = list(projector.parameters())
         if len(proj_params) > 0:
@@ -744,6 +757,7 @@ class LlavaMetaForCausalLM(ABC):
         # 4. 过 mm_projector：映射到语言模型空间
         image_features = projector(image_features)   # (B_or_sumV, N_patch, D_lm)
 
+        # [修正] 这里不再计算任何 Loss，保持函数纯净
         return image_features
 
 
@@ -757,11 +771,14 @@ class LlavaMetaForCausalLM(ABC):
             images,
             view_ids=None,
             orient_ids=None,
+            findings_embeds=None,  # 新增参数
+            **kwargs # [新增] 吸收 findings_embeds 等额外参数，防止报错
     ):
         vision_tower = self.get_vision_tower()
 
         # [2025-12-8] 每次调用先清空上一轮的缓存
         self._last_study_image_global = None
+        self._last_batch_view_feats = None      # [修正] 必须清空此缓存，防止不同 batch 间数据污染
         self._last_slot_div_loss = None
         self._last_slot_cov_loss = None
         self._last_router_entropy = None
@@ -833,13 +850,16 @@ class LlavaMetaForCausalLM(ABC):
                     picked.append(img[a])  # (3,H,W)
 
                 picked_images = torch.stack(picked, dim=0)          # (B,3,H,W)
-                image_features = self.encode_images(picked_images)  # (B,N_patch,D)
+                image_features = self.encode_images(picked_images, view_ids=None, findings_embeds=findings_embeds)  # (B,N_patch,D)
 
                 # 统一成 list[Tensor(N_patch,D)]
                 image_features = [feat for feat in image_features]
 
-                # cache：study-level global（只保留一份，避免重复计算）
                 self._last_study_image_global = torch.stack([feat.mean(dim=0) for feat in image_features], dim=0)
+                
+                # [修正] Baseline 模式下也需要缓存视图级特征，否则 llava_llama 计算 view-level loss 时会失效
+                # Baseline 相当于每个 study 只有一个 view (B, N_patch, D) -> list of (1, D)
+                self._last_batch_view_feats = [feat.mean(dim=0, keepdim=True) for feat in image_features]
                 self._last_router_entropy = None
                 self._last_slot_div_loss = None
                 self._last_slot_cov_loss = None
@@ -849,7 +869,11 @@ class LlavaMetaForCausalLM(ABC):
             # =========================================================
             else:
                 concat_images = torch.cat(image_list, dim=0)      # (sum_V,3,H,W)
-                all_feats = self.encode_images(concat_images)     # (sum_V,N_patch,D)
+                all_feats = self.encode_images(
+                    concat_images, 
+                    view_ids=None, # 这里通常不需要 view_ids 用于 projector，除非你有特殊逻辑
+                    findings_embeds=findings_embeds
+                )  # (sum_V,N_patch,D)
 
                 split_sizes = [img.shape[0] for img in image_list]
                 per_sample = torch.split(all_feats, split_sizes, dim=0)  # tuple[(V_i,Np,D)]
@@ -857,30 +881,42 @@ class LlavaMetaForCausalLM(ABC):
                 fused_features = []
                 router_ent_losses = []
 
+                # [2026-1-20] 修正：去除重复定义，统一初始化
                 view_ids_list = view_ids if view_ids is not None else [None] * len(per_sample)
                 orient_ids_list = orient_ids if orient_ids is not None else [None] * len(per_sample)
+                
+                # 用于存储每个 study 的原始视图特征 (V, D)，供 llava_llama 计算视图级一致性 loss
+                batch_view_features = []
 
                 for b, x in enumerate(per_sample):
                     V, Np, D = x.shape
                     v_ids = view_ids_list[b][:V] if view_ids_list[b] is not None else None
                     o_ids = orient_ids_list[b][:V] if orient_ids_list[b] is not None else None
 
+                    # 1. 收集视图级特征 (取 patch 平均) -> (V, D)
+                    # 此时 x 是 (V, Np, D)，mean(1) 得到每个视图的全局向量
+                    batch_view_features.append(x.mean(dim=1))
+
                     # [2026-1-7] 新增mamba_grid分支
                     if mv_fusion == "mamba_grid":
                         mv = getattr(model, "mv_grid_mamba", None)
                         if mv is None:
-                            raise RuntimeError("mv_grid_mamba is not found on core model; please init it in LlavaLlamaModel.__init__.")
+                            raise RuntimeError("mv_grid_mamba is not found on core model.")
 
                         step = int(getattr(model, "_mv_global_step", 0))  # 注意：写在 model 上更稳
                         fused_patches = mv(x, view_ids=v_ids, global_step=step)  # x: (V,Np,D) -> (Np,D)
                         fused_features.append(fused_patches)
-                    # [20026-1-7] 新增结束
+                    # [2026-1-7] 新增结束
                     else:
                         raise RuntimeError(f"Unknown MV_FUSION={mv_fusion}")
 
                 image_features = fused_features
+                
+                # 缓存特征供 Loss 计算使用
                 self._last_study_image_global = torch.stack([feat.mean(dim=0) for feat in image_features], dim=0)
-                self._last_router_entropy = torch.stack(router_ent_losses).mean() if len(router_ent_losses) > 0 else None
+                self._last_batch_view_feats = batch_view_features  # [NEW] 缓存列表 [Tensor(V1,D), Tensor(V2,D)...]
+                
+                self._last_router_entropy = None
                 self._last_slot_div_loss = None
                 self._last_slot_cov_loss = None
         else:

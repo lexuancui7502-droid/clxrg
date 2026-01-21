@@ -248,7 +248,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
         # 说明：
         # - vision_resampler：如果模型里不存在该模块，get_mm_adapter_state_maybe_zero_3 匹配不到会自动忽略，不会报错
         # - 仍保持文件名 mm_projector.bin / checkpoint-xxx.bin 不变，避免破坏你当前的加载逻辑
-        keys_to_match = ['mm_projector', 'vision_resampler', 'mv_grid_mamba', 'disease_head']
+        keys_to_match = ['mm_projector', 'vision_resampler', 'mv_grid_mamba', 'visual_disease_head', 'text_disease_head']
         # [2025-12-25] 修改结束
     
         if getattr(trainer.args, "use_im_start_end", False):
@@ -942,64 +942,76 @@ class LazySupervisedDataset(Dataset):
                 else:
                     y.append(float(val > 0.0))
                     m.append(1.0)
-            data_dict["disease_labels"] = torch.tensor(y, dtype=torch.float)
+            data_dict["chexpert_labels"] = torch.tensor(y, dtype=torch.float)
             data_dict["disease_mask"] = torch.tensor(m, dtype=torch.float)
-
         # [2025-12-12] 新增结束 chexpert_labels，实现疾病级对齐
+        
+        # [2025-12-12] 新增开始
+        # 1. 尝试从 json 的 "findings_emb_path" 路径加载 (如果是预计算好的 .pt 文件)
+        if "findings_emb_path" in sample and sample["findings_emb_path"] is not None:
+             if os.path.exists(sample["findings_emb_path"]):
+                 data_dict["findings_embeds"] = torch.load(sample["findings_emb_path"], map_location="cpu")
+        # 2. 或者，如果 json 里直接存了 list 形式的向量
+        elif "findings_embeds" in sample and sample["findings_embeds"] is not None:
+             data_dict["findings_embeds"] = torch.tensor(sample["findings_embeds"], dtype=torch.float)
 
+        # 同理处理 impression
+        if "impression_emb_path" in sample and sample["impression_emb_path"] is not None:
+             if os.path.exists(sample["impression_emb_path"]):
+                 data_dict["impression_embeds"] = torch.load(sample["impression_emb_path"], map_location="cpu")
+        elif "impression_embeds" in sample and sample["impression_embeds"] is not None:
+             data_dict["impression_embeds"] = torch.tensor(sample["impression_embeds"], dtype=torch.float)
+        # [2026-1-19] 新增结束
         return data_dict
 
 
 # 用来把多条样本拼成 batch（pad input_ids、pad labels 用 IGNORE_INDEX、构建 attention_mask、处理 images 的 stack/非一致 shape 情况）
+# [2026-01-20] 最终完美版：DataCollator (Input保留图片Token，Labels彻底清洗)
 @dataclass
 class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
-
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances]
-                                  for key in ("input_ids", "labels"))
+        # ... 原有的 input_ids 和 labels 处理保持不变 ...
+        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids,
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id)
-        labels = torch.nn.utils.rnn.pad_sequence(labels,
-                                                 batch_first=True,
-                                                 padding_value=IGNORE_INDEX)
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        
+        # 截断
         input_ids = input_ids[:, :self.tokenizer.model_max_length]
         labels = labels[:, :self.tokenizer.model_max_length]
+        
         batch = dict(
             input_ids=input_ids,
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-        if 'image' in instances[0]:
-            images = [instance['image'] for instance in instances]
-            if all(x is not None and x.shape == images[0].shape for x in images):
-                batch['images'] = torch.stack(images)
+        # [修复] 处理图片
+        if "image" in instances[0]:
+            images = [instance["image"] for instance in instances]
+            if all(x is not None and x.shape is not None for x in images):
+                batch["images"] = torch.stack(images)
             else:
-                batch['images'] = images
-            # ====== [2025-12=8] 新增：把 view_ids / orient_ids 一起打包传给 model ======
-            if "view_ids" in instances[0]:
-                batch["view_ids"] = [ins["view_ids"] for ins in instances]
-            if "orient_ids" in instances[0]:
-                batch["orient_ids"] = [ins["orient_ids"] for ins in instances]
+                batch["images"] = images
 
-        # [2025-12-12] 新增 拼接其它键时加入疾病级标签
+        # [关键修复] 显式传递 view_ids, orient_ids, disease_labels
+        # 注意：你在 Dataset 里存的是 'disease_labels'，但在 DataCollator 之前的代码里你在找 'chexpert_labels'，这里必须对应上！
+        
+        if "view_ids" in instances[0]:
+            batch["view_ids"] = torch.stack([instance["view_ids"] for instance in instances])
+            
+        if "orient_ids" in instances[0]:
+            batch["orient_ids"] = torch.stack([instance["orient_ids"] for instance in instances])
+
+        # 对应 Dataset 中的 key "disease_labels"
         if "disease_labels" in instances[0]:
-            batch["disease_labels"] = torch.stack(
-                [inst["disease_labels"] for inst in instances], dim=0
-            )
-            batch["disease_mask"] = torch.stack(
-                [inst["disease_mask"] for inst in instances], dim=0
-            )
-        # [2025-12-12] 新增结束 拼接其它键时加入疾病级标签
-
+            # 注意：llava_llama.py 需要的参数名是 chexpert_labels
+            batch["chexpert_labels"] = torch.stack([instance["disease_labels"] for instance in instances])
         return batch
-
-
+    
 # 返回 dict(train_dataset, eval_dataset, data_collator)，被 train() 用来传递给 Trainer
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
@@ -1093,7 +1105,7 @@ def train():
             core.mm_projector.requires_grad_(True)
 
         # 4) 其它 heads（若存在就解冻）
-        for name in ["study_align_head", "disease_head", "text_disease_head"]:
+        for name in ["study_align_head", "visual_disease_head", "text_disease_head"]: 
             if hasattr(core, name):
                 getattr(core, name).requires_grad_(True)
 
@@ -1183,6 +1195,11 @@ def train():
                 tokenizer=tokenizer,
                 model=model,
             )
+            # [新增修复] 强制检查 pad_token_id 是否越界，这是导致 CUDA Assert 崩溃的常见原因
+            embedding_size = model.get_input_embeddings().weight.shape[0]
+            if tokenizer.pad_token_id is not None and tokenizer.pad_token_id >= embedding_size:
+                print(f"[WARNING] Resizing embedding from {embedding_size} to {tokenizer.pad_token_id + 1} to accommodate pad_token_id")
+                model.resize_token_embeddings(tokenizer.pad_token_id + 1)
     elif model_args.version == "v0.5":
         tokenizer.pad_token = tokenizer.unk_token
     else:
@@ -1257,9 +1274,9 @@ def train():
         train_modules.append("view_attn")
     if hasattr(core, "mm_projector") and any(p.requires_grad for p in core.mm_projector.parameters()):
         train_modules.append("mm_projector")
-    for name in ["study_align_head", "disease_head", "text_disease_head"]:
-        if hasattr(core, name) and any(p.requires_grad for p in getattr(core, name).parameters()):
-            train_modules.append(name)
+    for name in ["study_align_head", "visual_disease_head", "text_disease_head"]:
+            if hasattr(core, name) and any(p.requires_grad for p in getattr(core, name).parameters()):
+                train_modules.append(name)
 
     trainable = [(n, p.numel()) for n, p in model.named_parameters() if p.requires_grad]
     n_trainable = sum(n for _, n in trainable)
@@ -1275,6 +1292,28 @@ def train():
     # 训练执行
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
+    
+    # [2026-1-19] 新增：调试检查数据是否包含embeds
+    rank0_print(f"[DEBUG] Data sample: {data_module['train_dataset'][0].keys()}")
+    # [2026-1-19] 新增结束
+
+    # [2026-1-19] 新增：Tokenizer & Embedding 安全检查 (防止 device-side assert 报错)
+    vocab_size = len(tokenizer)
+    embed_size = model.get_input_embeddings().weight.shape[0]
+    rank0_print(f"[SAFETY CHECK] Vocab Size: {vocab_size}, Model Embed Size: {embed_size}")
+    
+    if vocab_size > embed_size:
+        rank0_print(f"[WARNING] Vocab > Embed! Resizing model embeddings to {vocab_size}...")
+        model.resize_token_embeddings(vocab_size)
+        
+        # 再次确保 embedding 是可训练的 (防止被 freeze 策略误伤)
+        if hasattr(model.get_input_embeddings(), "weight"):
+             model.get_input_embeddings().weight.requires_grad_(True)
+    
+    # 确保 pad_token_id 在合法范围内
+    if tokenizer.pad_token_id is not None and tokenizer.pad_token_id >= embed_size:
+         rank0_print(f"[ERROR] pad_token_id {tokenizer.pad_token_id} is out of bounds!")
+    # [2026-1-19] 新增结束
 
     trainer = _MVTrainer(model=model,
                            tokenizer=tokenizer,

@@ -53,43 +53,26 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):                  # 组合视�
 
         # [2025-12-12] 疾病预测头保持不变
         self.num_diseases = 14
-        self.disease_head = nn.Linear(config.hidden_size, self.num_diseases)
-        self.chexpert_lambda = float(os.environ.get("CHEXPERT_LAMBDA", "0.1"))
+        # self.chexpert_lambda = float(os.environ.get("CHEXPERT_LAMBDA", "0.1"))
 
         # === AR-CVI 配置（都有默认值，保证可跑）===
         # self.mv_fusion = os.environ.get("MV_FUSION", "ar_cvi")
+        # [2026-1-19] 新增：定义视觉和文本疾病预测头，用于疾病级对齐；统一align_lambda从config获取，避免环境变量重复
+        self.visual_disease_head = nn.Linear(config.hidden_size, self.num_diseases)  # 视觉侧疾病预测头（study-level全局特征 -> 疾病logits）
+        self.text_disease_head = nn.Linear(config.hidden_size, self.num_diseases)    # 文本侧疾病预测头（报告embedding -> 疾病logits）
+        self.align_lambda = getattr(config, "align_lambda", 
+                                    float(os.environ.get("CHEXPERT_LAMBDA", "0.0")))
+        # [2026-1-19] 新增结束
 
         # [2026-1-7] 新增初始化mv_grid_mamba
-        self.mv_fusion = os.environ.get("MV_FUSION", "baseline").lower()
+        self.mv_fusion = getattr(config, "mv_fusion", os.environ.get("MV_FUSION", "baseline")).lower()
+        self.register_buffer("_mv_global_step", torch.tensor(0, dtype=torch.long))
 
         if self.mv_fusion == "mamba_grid":
             self.mv_grid_mamba = MVGridMambaFusion(dim=dim)
         if self.mv_fusion in ["view_attn", "slot"]:   # 目前你没有这些分支，仅保留“未来可能性”
             self.view_attn = SimpleViewAttention(dim=dim)
         # [2026-1-7] 新增结束
-
-        # evidence_tokens = int(os.environ.get("AR_CVI_EVID", str(getattr(config, "ar_cvi_evid", 16))))
-        # memory_tokens   = int(os.environ.get("AR_CVI_MEM",  str(getattr(config, "ar_cvi_mem", 32))))
-        # cvi_layers      = int(os.environ.get("AR_CVI_LAYERS", str(getattr(config, "ar_cvi_layers", 2))))
-        # attn_dim        = int(os.environ.get("AR_CVI_ATTN_DIM", str(getattr(config, "ar_cvi_attn_dim", 1024))))
-        # aux_r           = int(os.environ.get("AR_CVI_AUX_R", str(getattr(config, "ar_cvi_aux_r", 24))))
-
-        # num_view_types  = getattr(config, "num_view_types", 4)
-        # num_orient_types= getattr(config, "num_orient_types", 3)
-
-        # self.ar_cvi = ARCVIFusion(
-        #     dim=dim,
-        #     evidence_tokens=evidence_tokens,
-        #     memory_tokens=memory_tokens,
-        #     cvi_layers=cvi_layers,
-        #     attn_dim=attn_dim,
-        #     num_heads=8,
-        #     aux_downsample_r=aux_r,
-        #     dropout=0.0,
-        #     num_view_types=num_view_types,
-        #     num_orient_types=num_orient_types,
-        # )
-    # [2025-12-14] 修改 LlavaLlamaModel.__init__：移除 slot+gate，改为初始化 AR-CVI 结束
 
 # 语言生成模型，负责端到端的训练和推理。继承自 LlamaForCausalLM（纯文本生成模型）和 LlavaMetaForCausalLM（多模态支持）
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
@@ -137,17 +120,19 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         view_ids: Optional[List[torch.LongTensor]] = None,
         orient_ids: Optional[List[torch.LongTensor]] = None,
-        disease_labels: Optional[torch.FloatTensor] = None,   # ← [2025-12-12] 新增
-        disease_mask: Optional[torch.FloatTensor] = None,     # ← [2025-12-12] 新增
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:                  # 定义模型的前向传播逻辑，处理多模态输入（文本 + 图像）并生成预测结果
-        # 参数默认值处理​，如果参数未显式传入，则使用模型配置中的默认值。
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions       # 设置是否输出注意力权重
-        output_hidden_states = (                            # 设置是否输出隐藏状态
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states              # 如果未指定，则使用配置中的默认值
+        chexpert_labels: Optional[torch.FloatTensor] = None,  # [2026-01-18] 新增参数
+        findings_embeds: Optional[torch.FloatTensor] = None,  # findings文本预计算embedding (B, D)
+        impression_embeds: Optional[torch.FloatTensor] = None,  # impression文本预计算embedding (B, D)
+        **kwargs
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict                           # 设置是否返回字典形式的输出
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # 1. 准备多模态输入 (在这里会计算并缓存 _last_study_image_global 等)
         input_ids, attention_mask, past_key_values, inputs_embeds, labels = \
             self.prepare_inputs_labels_for_multimodal(
                 input_ids,
@@ -157,10 +142,10 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 images,
                 view_ids=view_ids,
                 orient_ids=orient_ids,
+                findings_embeds=findings_embeds,
             )
 
-
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)     调用模型主体计算隐藏状态、注意力权重等
+        # 2. 模型前向传播 (强制输出 hidden_states 用于文本对齐)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -168,129 +153,169 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=True, 
             return_dict=return_dict
         )
-        # 提取隐藏状态并通过 lm_head计算词汇表logits分数
+
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
+        logits = logits.float()
+
+        # [定位到 llava_llama.py 的 forward 函数内部，覆盖 if labels is not None: 开始的区域]
 
         loss = None
-        if labels is not None:              # 计算交叉熵损失，对齐预测和标签（标准语言模型训练方式）
+        if labels is not None:
             # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()         # 预测n的logits（去掉最后一个token）
-            shift_labels = labels[..., 1:].contiguous()             # 真实标签（去掉第一个token）
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
-            # Enable model/pipeline parallelism
+
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
 
+            # =========================================================================
+            # [2026-01-20] 修正：三层对齐 (Study-Level, Disease-Level, View-Level)
+            # =========================================================================
+            align_lambda = getattr(self.model, "align_lambda", 0.0)
 
-        # === [2025-12-2] 修改：检查级对齐（study-level image ↔ report text） ===
-        # 条件：有标签 + 有图像 + study_contrast_weight>0 才启用对比损失，目前是关闭的
-        if (
-            labels is not None
-            and getattr(self, "_last_study_image_global", None) is not None
-            and getattr(self, "study_contrast_weight", 0.0) > 0
-        ):
-            img_global = self._last_study_image_global.to(hidden_states.device)  # (B, D)
-            B, T, D = hidden_states.shape
+            # 只有在训练且 align_lambda > 0 时才计算对齐损失
+            if align_lambda > 0:
+                align_loss = torch.tensor(0.0, device=loss.device)
+                tau = getattr(self, "study_contrast_tau", 0.07)
+                epsilon = 1e-6  # 防止 normalize 除以 0
 
-            # 1) 用 labels!=IGNORE_INDEX 作为“报告 token”掩码
-            label_mask = labels != IGNORE_INDEX   # (B, T)
-            if attention_mask is not None:
-                label_mask = label_mask & attention_mask.bool()
+                # --- 获取全局特征 ---
+                # A. 视觉全局特征 (Study-Level)
+                visual_global = getattr(self, "_last_study_image_global", None)
 
-            # 2) 对每个样本，把对应 token 的 hidden_states 做 mean-pool，得到文本表征
-            text_pooled = []
-            for b in range(B):
-                h_b = hidden_states[b]   # (T, D)
-                m_b = label_mask[b]      # (T,)
-                if m_b.any():
-                    text_pooled.append(h_b[m_b].mean(dim=0))
+                # B. 文本全局特征 (Text-Level)
+                if attention_mask is not None:
+                    last_idx = attention_mask.sum(1) - 1
+                    last_idx = last_idx.clamp(min=0, max=hidden_states.size(1) - 1)
+                    text_global = hidden_states[
+                        torch.arange(hidden_states.size(0), device=hidden_states.device), last_idx]
                 else:
-                    text_pooled.append(h_b.mean(dim=0))
-            text_pooled = torch.stack(text_pooled, dim=0)   # (B, D)
+                    text_global = hidden_states[:, -1, :]
 
-            # 3) CLIP 风格 InfoNCE 对比：image ↔ text
-            img_norm = F.normalize(img_global, dim=-1)      # (B, D)
-            txt_norm = F.normalize(text_pooled, dim=-1)     # (B, D)
+                # -----------------------------------------------------------
+                # Layer 1: 疾病级对齐 (Disease-Level Alignment)
+                # -----------------------------------------------------------
+                # 确保 labels 存在且 visual_global 有效
+                if chexpert_labels is not None and visual_global is not None:
+                    chexpert_labels = chexpert_labels.to(hidden_states.device).float()
+                    
+                    # 只有当 label 维度和 head 输出维度匹配时才计算
+                    if chexpert_labels.shape[-1] == self.model.num_diseases:
+                        # 1.1 视觉 -> 疾病
+                        vis_logits = self.model.visual_disease_head(visual_global)
+                        align_loss += F.binary_cross_entropy_with_logits(vis_logits, chexpert_labels)
 
-            logits_per_img = img_norm @ txt_norm.t() / self.study_contrast_tau  # (B, B)
-            targets = torch.arange(B, device=logits_per_img.device)
+                        # 1.2 文本 -> 疾病
+                        txt_logits = self.model.text_disease_head(text_global)
+                        align_loss += F.binary_cross_entropy_with_logits(txt_logits, chexpert_labels)
 
-            loss_i2t = F.cross_entropy(logits_per_img, targets)
-            loss_t2i = F.cross_entropy(logits_per_img.t(), targets)
-            contrast_loss = 0.5 * (loss_i2t + loss_t2i)
+                        # 1.3 视觉 <-> 文本 一致性 (MSE on Probabilities)
+                        align_loss += F.mse_loss(torch.sigmoid(vis_logits), torch.sigmoid(txt_logits))
 
-            if loss is None:
-                loss = 0.0
-            loss = loss + self.study_contrast_weight * contrast_loss
+                # -----------------------------------------------------------
+                # Layer 2: 检查级对齐 (Study-Level Alignment)
+                # -----------------------------------------------------------
+                # 确保 embed 存在且非全零 (防止 padding 样本导致 NaN)
+                if findings_embeds is not None and impression_embeds is not None and visual_global is not None:
+                    # 使用 epsilon 防止除零错误
+                    visual_global_norm = F.normalize(visual_global, p=2, dim=-1, eps=epsilon)
+                    findings_norm = F.normalize(findings_embeds.to(visual_global.device), p=2, dim=-1, eps=epsilon)
+                    impression_norm = F.normalize(impression_embeds.to(visual_global.device), p=2, dim=-1, eps=epsilon)
 
-        # ====[2025-12-12] 新增 [CheXpert] 疾病多标签 BCE loss ====
-        import torch.nn.functional as F
+                    # 计算 InfoNCE (Batch 内对比)
+                    sim_findings = torch.matmul(visual_global_norm, findings_norm.t()) / tau
+                    sim_impression = torch.matmul(visual_global_norm, impression_norm.t()) / tau
 
-        chexpert_loss = None
-        model = self.get_model()
+                    # 标签：对角线为正样本
+                    target_idx = torch.arange(visual_global.size(0), device=visual_global.device)
 
-        if (
-            disease_labels is not None
-            and getattr(model, "disease_head", None) is not None
-            and getattr(self, "_last_study_image_global", None) is not None
-        ):
-            # 注意：_last_study_image_global 你之前是挂在 self 上的，保持一致比较安全
-            global_feats = self._last_study_image_global.to(hidden_states.device)  # (B, D)
-            logits_cls = model.disease_head(global_feats)                           # (B, 14)
+                    # 检查是否有全零向量导致相似度计算出问题，如果有则 masking 掉 (这里简化处理，假设数据预处理已过滤坏样本)
+                    study_loss = (F.cross_entropy(sim_findings, target_idx) + F.cross_entropy(sim_impression,
+                                                                                              target_idx)) / 2
+                    align_loss += study_loss
 
-            bce = F.binary_cross_entropy_with_logits(
-                logits_cls, disease_labels.to(logits_cls.device), reduction="none"
-            )  # (B,14)
+                # -----------------------------------------------------------
+                # Layer 3: 视图级对齐 (View-Level Alignment)
+                # -----------------------------------------------------------
+                raw_view_feats_list = getattr(self, "_last_batch_view_feats", None)
 
-            if disease_mask is not None:
-                bce = bce * disease_mask.to(bce.device)
-                denom = disease_mask.sum()
-                chexpert_loss = bce.sum() / (denom + 1e-6)
-            else:
-                chexpert_loss = bce.mean()
+                if raw_view_feats_list is not None and len(raw_view_feats_list) > 0:
+                    # --- A. 准备数据 ---
+                    all_views_flat = torch.cat(raw_view_feats_list, dim=0)  # (Total_Views, D)
+                    all_views_norm = F.normalize(all_views_flat, p=2, dim=-1, eps=epsilon)
 
-            lambda_c = getattr(model, "chexpert_lambda", 0.1)
-            if loss is None:
-                loss = lambda_c * chexpert_loss
-            else:
-                loss = loss + lambda_c * chexpert_loss
-        # ====[2025-12-12] 新增结束 [CheXpert] 疾病多标签 BCE loss ====
+                    # 构建归属标签
+                    view_study_ids = []
+                    for study_idx, v_feat in enumerate(raw_view_feats_list):
+                        view_study_ids.extend([study_idx] * v_feat.size(0))
+                    view_study_ids = torch.tensor(view_study_ids, device=all_views_flat.device)
 
+                    # --- B. 视图间一致性 (View-View Contrastive) ---
+                    # 计算相似度矩阵 (Total_Views, Total_Views)
+                    sim_matrix = torch.matmul(all_views_norm, all_views_norm.t()) / tau
 
-        # === slot 正则：多样性 + 视图覆盖 ===
-        if getattr(self, "_last_slot_div_loss", None) is not None:
-            slot_div_lambda = float(os.environ.get("SLOT_DIV_LAMBDA", "0.0"))
-            if slot_div_lambda > 0:
-                if loss is None:
-                    loss = 0.0
-                loss = loss + slot_div_lambda * self._last_slot_div_loss
+                    # 修正：InfoNCE 必须 mask 掉对角线 (自己与自己)，否则模型会“走捷径”
+                    mask_diag = torch.eye(len(view_study_ids), device=all_views_flat.device).bool()
+                    # 将对角线置为负无穷，使其在 softmax 中概率为 0
+                    sim_matrix.masked_fill_(mask_diag, -1e9)
 
-        if getattr(self, "_last_slot_cov_loss", None) is not None:
-            view_cov_lambda = float(os.environ.get("VIEW_COV_LAMBDA", "0.0"))
-            if view_cov_lambda > 0:
-                if loss is None:
-                    loss = 0.0
-                loss = loss + view_cov_lambda * self._last_slot_cov_loss
+                    # 正样本 Mask: 同一 Study 但不是自己
+                    labels_equal = view_study_ids.unsqueeze(0) == view_study_ids.unsqueeze(1)
+                    pos_mask = labels_equal & (~mask_diag)
 
+                    if pos_mask.sum() > 0:
+                        # Log-Sum-Exp Trick for numerical stability
+                        sim_max, _ = torch.max(sim_matrix, dim=1, keepdim=True)
+                        sim_matrix_sub = sim_matrix - sim_max.detach()
+                        exp_sim = torch.exp(sim_matrix_sub)
+
+                        # 分母：所有样本的 exp 和 (因为对角线已经是 -inf -> exp=0，所以这里直接 sum 即可)
+                        denominator = exp_sim.sum(dim=1)
+                        
+                        # 分子：仅正样本的 exp 和
+                        numerator = (exp_sim * pos_mask.float()).sum(dim=1)
+
+                        # 避免 log(0)
+                        valid_rows = (numerator > 0) & (denominator > 0)
+                        if valid_rows.sum() > 0:
+                            log_prob = torch.log(numerator[valid_rows] / (denominator[valid_rows] + 1e-8))
+                            align_loss += -log_prob.mean()
+
+                    # --- C. 视图-文本对齐 (View-Text Alignment) ---
+                    if findings_embeds is not None:
+                        findings_norm = F.normalize(findings_embeds.to(all_views_norm.device), p=2, dim=-1, eps=epsilon)
+                        
+                        # (Total_Views, Batch_Size)
+                        vt_sim_matrix = torch.matmul(all_views_norm, findings_norm.t()) / tau
+                        
+                        # Target: 每个视图属于哪个 Study Index (Batch Index)
+                        vt_loss = F.cross_entropy(vt_sim_matrix, view_study_ids)
+                        align_loss += vt_loss
+
+                # 最后加上权重
+                loss += align_lambda * align_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
+            return ((loss,) + output) if loss is not None else output
 
-        return CausalLMOutputWithPast(          # 返回结构化输出（损失、logits、KV缓存等）
+        return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
 
     def prepare_inputs_for_generation(                  # 在生成任务（如自回归生成）中动态准备输入数据。
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs

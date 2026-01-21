@@ -241,6 +241,31 @@ class _MVTrainer(LLaVATrainer):
             print(f"  - lr={lr:.2e} wd={wd:.2e} params={n/1e6:.2f}M")
         # [2025-12-25] 修改结束
         return self.optimizer
+    
+    # [2026-1-20] 新增：重写 training_step 以更新 global_step
+    def training_step(self, model, inputs):
+        """
+        Perform a training step on a batch of inputs.
+        更新模型内部的 global_step，确保 MVGridMamba 的 Ramp 策略能读取到当前步数。
+        """
+        # 1. 获取最底层的模型 (处理 DDP/Deepspeed 的包裹层)
+        if hasattr(model, "module"):
+            core_model = model.module
+        else:
+            core_model = model
+            
+        # 2. 深入获取到 LlavaLlamaModel
+        # model 可能是 LlavaLlamaForCausalLM，它的 .model 属性才是 LlavaLlamaModel
+        if hasattr(core_model, "get_model"):
+            llava_model = core_model.get_model()
+            # 3. 更新 step buffer
+            # 注意：我们在 init 里注册了 register_buffer("_mv_global_step", ...)
+            if hasattr(llava_model, "_mv_global_step"):
+                # 将 Trainer 的当前步数同步进去
+                llava_model._mv_global_step.fill_(self.state.global_step)
+        
+        # 4. 执行原本的训练步
+        return super().training_step(model, inputs)
 
     # [2025-12-26] 新增学习率相关代码
     def create_scheduler(self, num_training_steps: int, optimizer: Optional[torch.optim.Optimizer] = None):
@@ -277,14 +302,3 @@ class _MVTrainer(LLaVATrainer):
                 logs[f"lr/group_{i}"] = g.get("lr", None)
         return super().log(logs)
     # [2025-12-27] 新增结束
-
-    # [2026-1-7] 新增
-    def training_step(self, model, inputs):
-        # 将 global_step 写到 core model 上，供 MVGridMambaFusion 做 ramp
-        core = model.module if hasattr(model, "module") else model
-        if hasattr(core, "get_model"):
-            core.get_model()._mv_global_step = int(self.state.global_step)
-        else:
-            core._mv_global_step = int(self.state.global_step)
-        return super().training_step(model, inputs)
-    # [2026-1-7] 新增结束
