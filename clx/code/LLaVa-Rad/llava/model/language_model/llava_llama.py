@@ -225,81 +225,81 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 # Layer 2: 检查级对齐 (Study-Level Alignment)
                 # -----------------------------------------------------------
                 # 确保 embed 存在且非全零 (防止 padding 样本导致 NaN)
-                if findings_embeds is not None and impression_embeds is not None and visual_global is not None:
-                    # 使用 epsilon 防止除零错误
-                    visual_global_norm = F.normalize(visual_global, p=2, dim=-1, eps=epsilon)
-                    findings_norm = F.normalize(findings_embeds.to(visual_global.device), p=2, dim=-1, eps=epsilon)
-                    impression_norm = F.normalize(impression_embeds.to(visual_global.device), p=2, dim=-1, eps=epsilon)
+                # if findings_embeds is not None and impression_embeds is not None and visual_global is not None:
+                #     # 使用 epsilon 防止除零错误
+                #     visual_global_norm = F.normalize(visual_global, p=2, dim=-1, eps=epsilon)
+                #     findings_norm = F.normalize(findings_embeds.to(visual_global.device), p=2, dim=-1, eps=epsilon)
+                #     impression_norm = F.normalize(impression_embeds.to(visual_global.device), p=2, dim=-1, eps=epsilon)
 
-                    # 计算 InfoNCE (Batch 内对比)
-                    sim_findings = torch.matmul(visual_global_norm, findings_norm.t()) / tau
-                    sim_impression = torch.matmul(visual_global_norm, impression_norm.t()) / tau
+                #     # 计算 InfoNCE (Batch 内对比)
+                #     sim_findings = torch.matmul(visual_global_norm, findings_norm.t()) / tau
+                #     sim_impression = torch.matmul(visual_global_norm, impression_norm.t()) / tau
 
-                    # 标签：对角线为正样本
-                    target_idx = torch.arange(visual_global.size(0), device=visual_global.device)
+                #     # 标签：对角线为正样本
+                #     target_idx = torch.arange(visual_global.size(0), device=visual_global.device)
 
-                    # 检查是否有全零向量导致相似度计算出问题，如果有则 masking 掉 (这里简化处理，假设数据预处理已过滤坏样本)
-                    study_loss = (F.cross_entropy(sim_findings, target_idx) + F.cross_entropy(sim_impression,
-                                                                                              target_idx)) / 2
-                    align_loss += study_loss
+                #     # 检查是否有全零向量导致相似度计算出问题，如果有则 masking 掉 (这里简化处理，假设数据预处理已过滤坏样本)
+                #     study_loss = (F.cross_entropy(sim_findings, target_idx) + F.cross_entropy(sim_impression,
+                #                                                                               target_idx)) / 2
+                #     align_loss += study_loss
 
-                # -----------------------------------------------------------
-                # Layer 3: 视图级对齐 (View-Level Alignment)
-                # -----------------------------------------------------------
-                raw_view_feats_list = getattr(self, "_last_batch_view_feats", None)
+                # # -----------------------------------------------------------
+                # # Layer 3: 视图级对齐 (View-Level Alignment)
+                # # -----------------------------------------------------------
+                # raw_view_feats_list = getattr(self, "_last_batch_view_feats", None)
 
-                if raw_view_feats_list is not None and len(raw_view_feats_list) > 0:
-                    # --- A. 准备数据 ---
-                    all_views_flat = torch.cat(raw_view_feats_list, dim=0)  # (Total_Views, D)
-                    all_views_norm = F.normalize(all_views_flat, p=2, dim=-1, eps=epsilon)
+                # if raw_view_feats_list is not None and len(raw_view_feats_list) > 0:
+                #     # --- A. 准备数据 ---
+                #     all_views_flat = torch.cat(raw_view_feats_list, dim=0)  # (Total_Views, D)
+                #     all_views_norm = F.normalize(all_views_flat, p=2, dim=-1, eps=epsilon)
 
-                    # 构建归属标签
-                    view_study_ids = []
-                    for study_idx, v_feat in enumerate(raw_view_feats_list):
-                        view_study_ids.extend([study_idx] * v_feat.size(0))
-                    view_study_ids = torch.tensor(view_study_ids, device=all_views_flat.device)
+                #     # 构建归属标签
+                #     view_study_ids = []
+                #     for study_idx, v_feat in enumerate(raw_view_feats_list):
+                #         view_study_ids.extend([study_idx] * v_feat.size(0))
+                #     view_study_ids = torch.tensor(view_study_ids, device=all_views_flat.device)
 
-                    # --- B. 视图间一致性 (View-View Contrastive) ---
-                    # 计算相似度矩阵 (Total_Views, Total_Views)
-                    sim_matrix = torch.matmul(all_views_norm, all_views_norm.t()) / tau
+                #     # --- B. 视图间一致性 (View-View Contrastive) ---
+                #     # 计算相似度矩阵 (Total_Views, Total_Views)
+                #     sim_matrix = torch.matmul(all_views_norm, all_views_norm.t()) / tau
 
-                    # 修正：InfoNCE 必须 mask 掉对角线 (自己与自己)，否则模型会“走捷径”
-                    mask_diag = torch.eye(len(view_study_ids), device=all_views_flat.device).bool()
-                    # 将对角线置为负无穷，使其在 softmax 中概率为 0
-                    sim_matrix.masked_fill_(mask_diag, -1e9)
+                #     # 修正：InfoNCE 必须 mask 掉对角线 (自己与自己)，否则模型会“走捷径”
+                #     mask_diag = torch.eye(len(view_study_ids), device=all_views_flat.device).bool()
+                #     # 将对角线置为负无穷，使其在 softmax 中概率为 0
+                #     sim_matrix.masked_fill_(mask_diag, -1e9)
 
-                    # 正样本 Mask: 同一 Study 但不是自己
-                    labels_equal = view_study_ids.unsqueeze(0) == view_study_ids.unsqueeze(1)
-                    pos_mask = labels_equal & (~mask_diag)
+                #     # 正样本 Mask: 同一 Study 但不是自己
+                #     labels_equal = view_study_ids.unsqueeze(0) == view_study_ids.unsqueeze(1)
+                #     pos_mask = labels_equal & (~mask_diag)
 
-                    if pos_mask.sum() > 0:
-                        # Log-Sum-Exp Trick for numerical stability
-                        sim_max, _ = torch.max(sim_matrix, dim=1, keepdim=True)
-                        sim_matrix_sub = sim_matrix - sim_max.detach()
-                        exp_sim = torch.exp(sim_matrix_sub)
+                #     if pos_mask.sum() > 0:
+                #         # Log-Sum-Exp Trick for numerical stability
+                #         sim_max, _ = torch.max(sim_matrix, dim=1, keepdim=True)
+                #         sim_matrix_sub = sim_matrix - sim_max.detach()
+                #         exp_sim = torch.exp(sim_matrix_sub)
 
-                        # 分母：所有样本的 exp 和 (因为对角线已经是 -inf -> exp=0，所以这里直接 sum 即可)
-                        denominator = exp_sim.sum(dim=1)
+                #         # 分母：所有样本的 exp 和 (因为对角线已经是 -inf -> exp=0，所以这里直接 sum 即可)
+                #         denominator = exp_sim.sum(dim=1)
                         
-                        # 分子：仅正样本的 exp 和
-                        numerator = (exp_sim * pos_mask.float()).sum(dim=1)
+                #         # 分子：仅正样本的 exp 和
+                #         numerator = (exp_sim * pos_mask.float()).sum(dim=1)
 
-                        # 避免 log(0)
-                        valid_rows = (numerator > 0) & (denominator > 0)
-                        if valid_rows.sum() > 0:
-                            log_prob = torch.log(numerator[valid_rows] / (denominator[valid_rows] + 1e-8))
-                            align_loss += -log_prob.mean()
+                #         # 避免 log(0)
+                #         valid_rows = (numerator > 0) & (denominator > 0)
+                #         if valid_rows.sum() > 0:
+                #             log_prob = torch.log(numerator[valid_rows] / (denominator[valid_rows] + 1e-8))
+                #             align_loss += -log_prob.mean()
 
-                    # --- C. 视图-文本对齐 (View-Text Alignment) ---
-                    if findings_embeds is not None:
-                        findings_norm = F.normalize(findings_embeds.to(all_views_norm.device), p=2, dim=-1, eps=epsilon)
+                #     # --- C. 视图-文本对齐 (View-Text Alignment) ---
+                #     if findings_embeds is not None:
+                #         findings_norm = F.normalize(findings_embeds.to(all_views_norm.device), p=2, dim=-1, eps=epsilon)
                         
-                        # (Total_Views, Batch_Size)
-                        vt_sim_matrix = torch.matmul(all_views_norm, findings_norm.t()) / tau
+                #         # (Total_Views, Batch_Size)
+                #         vt_sim_matrix = torch.matmul(all_views_norm, findings_norm.t()) / tau
                         
-                        # Target: 每个视图属于哪个 Study Index (Batch Index)
-                        vt_loss = F.cross_entropy(vt_sim_matrix, view_study_ids)
-                        align_loss += vt_loss
+                #         # Target: 每个视图属于哪个 Study Index (Batch Index)
+                #         vt_loss = F.cross_entropy(vt_sim_matrix, view_study_ids)
+                #         align_loss += vt_loss
 
                 # 最后加上权重
                 loss += align_lambda * align_loss

@@ -41,6 +41,7 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token, open_image_with_retry
 from llava.utils import data_loaders
+from transformers import EarlyStoppingCallback
 
 from PIL import Image, ImageFile
 
@@ -95,6 +96,7 @@ class ModelArguments:  # 控制模型选择与结构级别的多模态选项
 class DataArguments:  # 控制数据集加载与预处理选项
     data_path: str = field(default=None,
                            metadata={"help": "Path to the training data."})  # 训练数据路径，默认为 None
+    eval_data_path: str = field(default=None, metadata={"help": "Path to the evaluation data."})        # [2026-1-22] 新增验证集
     loader: str = "default"  # 数据加载器类型，默认使用 "default" 加载器
     lazy_preprocess: bool = False  # 是否启用延迟预处理，默认为 False
     is_multimodal: bool = False  # 是否为多模态数据集，默认为 False
@@ -973,7 +975,7 @@ class DataCollatorForSupervisedDataset(object):
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        # ... 原有的 input_ids 和 labels 处理保持不变 ...
+        # 1. 处理文本输入 (input_ids, labels) -> 必须 Pad 成 Tensor
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
@@ -989,27 +991,26 @@ class DataCollatorForSupervisedDataset(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-        # [修复] 处理图片
+        # 2. 处理多模态图像 (images) -> 保持为 List，处理不同视角数
         if "image" in instances[0]:
             images = [instance["image"] for instance in instances]
             if all(x is not None and x.shape is not None for x in images):
-                batch["images"] = torch.stack(images)
+                # 原始代码通常是 batch['images'] = torch.stack(images) -> 这会导致报错
+                # 请修改为直接赋值列表：
+                batch["images"] = images 
             else:
                 batch["images"] = images
 
-        # [关键修复] 显式传递 view_ids, orient_ids, disease_labels
-        # 注意：你在 Dataset 里存的是 'disease_labels'，但在 DataCollator 之前的代码里你在找 'chexpert_labels'，这里必须对应上！
-        
+        # [必须检查这里]：View IDs 也存为 List
         if "view_ids" in instances[0]:
-            batch["view_ids"] = torch.stack([instance["view_ids"] for instance in instances])
+            batch["view_ids"] = [instance["view_ids"] for instance in instances]
             
         if "orient_ids" in instances[0]:
-            batch["orient_ids"] = torch.stack([instance["orient_ids"] for instance in instances])
+            batch["orient_ids"] = [instance["orient_ids"] for instance in instances]
 
-        # 对应 Dataset 中的 key "disease_labels"
-        if "disease_labels" in instances[0]:
-            # 注意：llava_llama.py 需要的参数名是 chexpert_labels
-            batch["chexpert_labels"] = torch.stack([instance["disease_labels"] for instance in instances])
+        # [保持不变]：Labels 长度固定，必须 stack
+        if "chexpert_labels" in instances[0]:
+            batch["chexpert_labels"] = torch.stack([instance["chexpert_labels"] for instance in instances])
         return batch
     
 # 返回 dict(train_dataset, eval_dataset, data_collator)，被 train() 用来传递给 Trainer
@@ -1019,9 +1020,19 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
                                           data_path=data_args.data_path,
                                           data_args=data_args)
+    
+    # [2026-1-22] 新增测试集加载
+    eval_dataset = None
+    if data_args.eval_data_path:
+        print(f"[INFO] Loading Eval Dataset from: {data_args.eval_data_path}")
+        eval_dataset = LazySupervisedDataset(tokenizer=tokenizer,
+                                             data_path=data_args.eval_data_path,
+                                             data_args=data_args) # 复用 image_folder 等配置
+    # [2026-1-22] 结束
+
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset,
-                eval_dataset=None,
+                eval_dataset=eval_dataset,
                 data_collator=data_collator)
 
 
@@ -1187,6 +1198,49 @@ def train():
             use_fast=False,
         )
 
+    # ================= [新增] 权重加载终极验证探针 =================
+    rank0_print("n" + "="*50)
+    rank0_print("【WEIGHT LOADING VERIFICATION】")
+    
+    # 1. 验证 Mamba 融合层 (BiMamba Fuse Projection)
+    # 你的初始化逻辑是：对角线为 0.5，其余为 0
+    if hasattr(model.get_model(), "mv_grid_mamba"):
+        fuse_layer = model.get_model().mv_grid_mamba.bi.fuse_proj
+        weight_mean = fuse_layer.weight.data.mean().item()
+        weight_std = fuse_layer.weight.data.std().item()
+        
+        # 获取对角线元素样本
+        diag_sample = fuse_layer.weight.data[0, 0].item()
+        
+        rank0_print(f"[Mamba] Fuse Proj Mean: {weight_mean:.6f} (Expect ~0.000xxx if trained)")
+        rank0_print(f"[Mamba] Fuse Proj Std : {weight_std:.6f}")
+        rank0_print(f"[Mamba] Diag Sample   : {diag_sample:.6f} (Init was 0.5)")
+        
+        # 判断逻辑：如果完全等于 0.5，说明没训练或没加载；如果有偏移，说明加载了训练参数
+        if abs(diag_sample - 0.5) < 1e-6:
+             rank0_print("⚠️ [WARNING] Mamba weights look exactly like INITIALIZATION! (Not loaded?)")
+        else:
+             rank0_print("✅ [SUCCESS] Mamba weights verified as TRAINED (drifted from init).")
+    else:
+        rank0_print("❌ [ERROR] mv_grid_mamba module NOT found in model!")
+
+    # 2. 验证 CheXpert Head
+    if hasattr(model.get_model(), "visual_disease_head"):
+        head = model.get_model().visual_disease_head
+        head_mean = head.weight.data.mean().item()
+        head_std = head.weight.data.std().item()
+        rank0_print(f"[Head] Visual Disease Head Mean: {head_mean:.6f}")
+        rank0_print(f"[Head] Visual Disease Head Std : {head_std:.6f}")
+        
+        # 这里的判断标准比较模糊，只要 Std 不是 0 且不是极小的随机分布即可
+        if head_std > 1e-6:
+             rank0_print("✅ [SUCCESS] Disease Head looks active.")
+    else:
+        rank0_print("❌ [ERROR] visual_disease_head NOT found!")
+        
+    rank0_print("="*50 + "n")
+    # =============================================================
+
     # Pad Token处理：根据不同版本设置pad token
     if model_args.version == "v0":
         if tokenizer.pad_token is None:
@@ -1318,6 +1372,7 @@ def train():
     trainer = _MVTrainer(model=model,
                            tokenizer=tokenizer,
                            args=training_args,
+                           callbacks=[EarlyStoppingCallback(early_stopping_patience=3, early_stopping_threshold=0.005)],  # [2026-1-22] 新增 callbacks 参数
                            **data_module)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):

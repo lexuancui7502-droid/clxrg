@@ -696,6 +696,86 @@ class LlavaMetaModel:
 
             # 将提取的权重加载到新创建的投影器中
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+            print("[SUCCESS] mm_projector loaded.")
+
+            # 2. [2026-1-23] 新增加载 Fusion Mamba (mv_grid_mamba)
+            # 只有当 key 中包含 mv_grid_mamba 且模型有该模块时才加载
+            if hasattr(self, "mv_grid_mamba") and any("mv_grid_mamba" in k for k in mm_projector_weights.keys()):
+                print(f"[DEBUG] Found {len([k for k in mm_projector_weights.keys() if 'mv_grid_mamba' in k])} Mamba keys in checkpoint.")
+                
+                # --- [新增验证 1]：打印加载前的某个权重均值 ---
+                old_weight_val = self.mv_grid_mamba.bi.fuse_proj.weight.data.mean().item()
+                print(f"[DEBUG] Before loading, Mamba fuse_proj mean: {old_weight_val:.8f}")
+                # 你的保存逻辑是直接保存 model.named_parameters()，所以 key 可能是 "model.mv_grid_mamba.xxx" 或直接 "mv_grid_mamba.xxx"
+                # 需要根据保存时的 key 结构适配。通常 safe_save_model_for_hf_trainer 里的 get_mm_adapter_state_maybe_zero_3 会保留完整名
+                # 假设保存的 key 是 "model.mv_grid_mamba.bi.fwd..."，我们需要去掉前缀匹配
+
+                mamba_dict = {}
+                for k, v in mm_projector_weights.items():
+                    if "mv_grid_mamba" in k:
+                        # 简单粗暴的处理：找到 mv_grid_mamba 之后的部分
+                        # 例如 model.mv_grid_mamba.local.in_proj.weight -> local.in_proj.weight
+                        suffix = k.split("mv_grid_mamba.")[-1]
+                        mamba_dict[suffix] = v
+
+                # self.mv_grid_mamba.load_state_dict(mamba_dict, strict=False)
+
+                # --- [验证步骤 B]：执行加载并获取结果 ---
+                missing, unexpected = self.mv_grid_mamba.load_state_dict(mamba_dict, strict=False)
+                
+                # --- [验证步骤 C]：记录加载后的权重均值 ---
+                new_weight_val = self.mv_grid_mamba.bi.fuse_proj.weight.data.mean().item()
+                print(f"[DEBUG] After loading,  Mamba fuse_proj mean: {new_weight_val:.8f}")
+
+                # --- [验证步骤 D]：最终判定 ---
+                if len(missing) > 0:
+                    print(f"[WARNING] Mamba Missing keys: {len(missing)} (First 5: {missing[:5]})")
+                
+                if abs(old_weight_val - new_weight_val) < 1e-9:
+                    print("[ERROR] !!! Mamba weights did NOT change! Loading might have FAILED (or init happened to be same) !!!")
+                else:
+                    print("[SUCCESS] Mamba weights changed and loaded successfully.")
+
+            else:
+                print("[WARNING] 'mv_grid_mamba' NOT found in checkpoint or model! Initializing randomly.")
+
+            # 3. 新增加载 Disease Heads
+            for head_name in ["visual_disease_head", "text_disease_head"]:
+                # 检查模型里有没有这个头，且权重文件里有没有这个头的 key
+                if hasattr(self, head_name) and any(head_name in k for k in mm_projector_weights.keys()):
+                    module = getattr(self, head_name)
+                    print(f"---------------- Checking {head_name} ----------------")
+                    
+                    # [验证 A] 旧值
+                    old_h_val = module.weight.data.mean().item()
+                    print(f"[DEBUG] Before: {old_h_val:.8f}")
+
+                    # 提取
+                    head_dict = {}
+                    for k, v in mm_projector_weights.items():
+                        if head_name in k:
+                            suffix = k.split(f"{head_name}.")[-1]
+                            head_dict[suffix] = v
+                    
+                    # [验证 B] 加载
+                    missing, unexpected = module.load_state_dict(head_dict, strict=False)
+                    
+                    # [验证 C] 新值
+                    new_h_val = module.weight.data.mean().item()
+                    print(f"[DEBUG] After : {new_h_val:.8f}")
+
+                    # [验证 D] 判定
+                    if len(missing) > 0:
+                        print(f"[WARNING] {head_name} Missing keys: {missing}")
+                    
+                    if abs(old_h_val - new_h_val) < 1e-9:
+                        print(f"[ERROR] !!! {head_name} weights did NOT change! !!!")
+                    else:
+                        print(f"[SUCCESS] {head_name} loaded successfully.")
+                    print("-------------------------------------------------------")
+                else:
+                    print(f"[WARNING] {head_name} skipped (not in model or not in checkpoint).")
+            # --- [2026-1-23] 修改结束  ---
 
 
 # 抽象基类，定义多模态因果语言模型的接口
